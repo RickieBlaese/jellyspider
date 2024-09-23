@@ -114,6 +114,9 @@ void mpzs_geometric_dist(mpzw_t &out, const dec_t &base = GEN_DEFAULT_BASE) {
     a = mpfr::log(1.0 - a);
     a /= mpfr::log(base);
     mpfr_sqr(a.mpfr_ptr(), a.mpfr_srcptr(), dec_t::get_default_rnd());
+    if (get_random_int<bool>(false, true)) {
+        mpfr_neg(a.mpfr_ptr(), a.mpfr_srcptr(), dec_t::get_default_rnd());
+    }
     mpfr_get_z(out.z, a.mpfr_srcptr(), dec_t::get_default_rnd());
 }
 
