@@ -38,6 +38,11 @@ using Out = std::type_identity_t<T>;
 #define Inout(T) Inout<T>
 #define Out(T) Out<T>
 
+#define DEF_ALL_PTRS(X) using sptr ## X = std::shared_ptr<X>; \
+using wptr ## X = std::weak_ptr<X>; \
+using uptr ## X = std::unique_ptr<X>;
+
+
 #ifdef DEBUG_BUILD
 
 #define ERR_EXIT(A, ...) { \
@@ -86,6 +91,10 @@ T get_random_real(const T &a, const T &b) {
 
 using dec_t = mpfr::mpreal;
 
+struct mpzw_t {
+    mpz_t z;
+};
+
 /* NOLINTBEGIN */
 
 gmp_randstate_t randstate;
@@ -99,13 +108,13 @@ mp_bitcnt_t rand_geo_limit = 128;
 /* NOLINTEND */
 
 /* assumes out is initialized */
-void mpz_geometric_dist(mpz_t &out, const dec_t &base = GEN_DEFAULT_BASE) {
+void mpzs_geometric_dist(mpzw_t &out, const dec_t &base = GEN_DEFAULT_BASE) {
     dec_t a(0, static_cast<mpfr_prec_t>(rand_geo_limit));
     mpfr_urandomb(a.mpfr_ptr(), randstate); /* now a is in [0, 1) */
     a = mpfr::log(1.0 - a);
     a /= mpfr::log(base);
     mpfr_sqr(a.mpfr_ptr(), a.mpfr_srcptr(), dec_t::get_default_rnd());
-    mpfr_get_z(out, a.mpfr_srcptr(), dec_t::get_default_rnd());
+    mpfr_get_z(out.z, a.mpfr_srcptr(), dec_t::get_default_rnd());
 }
 
 void dec_compress(dec_t &a, const dec_t &base = GEN_DEFAULT_BASE) {
@@ -122,10 +131,57 @@ double double_compress(double a, const double &base = GEN_DEFAULT_BASE) {
 }
 
 /* assumes a > 0 */
-double mpz_compress_double(const mpz_t &a, const dec_t &base = GEN_DEFAULT_BASE) {
-    dec_t r = a;
+double mpzs_compress_double(const mpzw_t &a, const dec_t &base = GEN_DEFAULT_BASE) {
+    dec_t r = a.z;
     dec_compress(r, base);
     return r.toDouble();
+}
+
+struct range_t {
+    std::size_t a = 0, b = 0;
+};
+
+struct matched_pair_t {
+    range_t x, y;
+};
+
+template <typename T>
+double vec_similarity(const std::vector<T> &x, const std::vector<T> &y) {
+    std::vector<matched_pair_t> s;
+    for (std::size_t ai = 0; ai < x.size(); ai++) {
+        for (std::size_t bi = 0; bi < y.size(); bi++) {
+            if (x[ai] == y[bi]) {
+
+                /* check for overlap */
+                bool skip = false;
+                for (const matched_pair_t &mp : s) {
+                     if ((mp.x.a <= ai && ai < mp.x.b) || (mp.y.a <= bi && bi < mp.y.b)) {
+                        skip = true;
+                        break;
+                    }
+                }
+                if (skip) {
+                    continue;
+                }
+
+                s.push_back(matched_pair_t{range_t{ai, ai+1}, range_t{bi, bi+1}});
+                for (ai++, bi++; ai < x.size() && bi < y.size(); ai++, bi++) {
+                    if (x[ai] != y[bi]) {
+                        break;
+                    }
+                }
+                s[s.size() - 1].x.b = ai;
+                s[s.size() - 1].y.b = bi;
+            }
+        }
+    }
+
+    std::size_t total_len = 0;
+    for (const matched_pair_t &mp : s) {
+        total_len += mp.x.b - mp.x.a;
+    }
+
+    return static_cast<double>(total_len)/static_cast<double>(std::min(x.size(), y.size()));
 }
 
 enum struct otype_t : std::uint16_t {
@@ -147,7 +203,7 @@ enum struct otype_t : std::uint16_t {
 struct obj_t {
     std::optional<std::string> name; /* has value when it's an unspecified object - i.e. with .v as monostate */
     otype_t type = otype_t::none;
-    std::variant<std::monostate, bool, mpz_t, dec_t> v; /* bool_v, int_v, and dec_v */
+    std::variant<std::monostate, bool, mpzw_t, dec_t> v; /* bool_v, int_v, and dec_v */
 
     bool operator==(const obj_t &other) const {
         bool res = type == other.type && name.has_value() == other.name.has_value() && v.index() == other.v.index();
@@ -155,8 +211,8 @@ struct obj_t {
             std::visit([&res, &other](const auto &val) {
                 if constexpr (std::is_same_v<decltype(val), bool>) {
                     res = res && val == std::get<bool>(other.v);
-                } else if constexpr (std::is_same_v<decltype(val), mpz_t>) {
-                    res = res && !mpz_cmp(val, std::get<mpz_t>(other.v));
+                } else if constexpr (std::is_same_v<decltype(val), mpzw_t>) {
+                    res = res && !mpz_cmp(val, std::get<mpzw_t>(other.v));
                 } else if constexpr (std::is_same_v<decltype(val), dec_t>) {
                     res = res && val == std::get<dec_t>(other.v);
                 }
@@ -172,10 +228,10 @@ struct obj_t {
         name = other.name;
         type = other.type;
         std::visit([this](const auto &val) {
-            if constexpr (std::is_same_v<decltype(val), mpz_t>) {
-                v = mpz_t{};
-                auto &tz = std::get<mpz_t>(v);
-                mpz_init_set(tz, std::get<mpz_t>(val));
+            if constexpr (std::is_same_v<decltype(val), mpzw_t>) {
+                v = mpzw_t{};
+                auto &tz = std::get<mpzw_t>(v);
+                mpz_init_set(tz, std::get<mpzw_t>(val));
             } else {
                 v = val;
             }
@@ -192,6 +248,7 @@ enum struct etype_t : std::uint16_t {
     none,
 
     objexpr_t,
+    addexpr_t,
     eqexpr_t,
     andexpr_t, orexpr_t, notexpr_t,
     unionexpr_t, intersectexpr_t, containedexpr_t, subsetexpr_t, subtractexpr_t,
@@ -203,6 +260,7 @@ enum struct etype_t : std::uint16_t {
 const std::unordered_map<etype_t, std::string> etype_to_str = { /* NOLINT */
     {etype_t::none, "none"},
     {etype_t::objexpr_t, "objexpr"},
+    {etype_t::addexpr_t, "addexpr"},
     {etype_t::eqexpr_t, "eqexpr"},
     {etype_t::andexpr_t, "andexpr"},
     {etype_t::orexpr_t, "orexpr"},
@@ -219,9 +277,7 @@ const std::unordered_map<etype_t, std::string> etype_to_str = { /* NOLINT */
 
 struct expr_t;
 
-using sptrexpr_t = std::shared_ptr<expr_t>;
-using wptrexpr_t = std::weak_ptr<expr_t>;
-using uptrexpr_t = std::unique_ptr<expr_t>;
+DEF_ALL_PTRS(expr_t);
 
 struct thm_t;
 
@@ -308,6 +364,7 @@ struct vec_t {
 
 struct objexpr_t;
 
+DEF_ALL_PTRS(objexpr_t)
 
 /* NOLINTBEGIN */
 
@@ -358,8 +415,9 @@ struct expr_t { /* NOLINT */
         return res;
     } */
 
-    virtual uptrexpr_t copy_shallow() const {
-        uptrexpr_t e = std::make_unique<expr_t>();
+    template <typename T>
+    uptrexpr_t base_copy_shallow() const {
+        uptrexpr_t e(dynamic_cast<expr_t*>(new T));
         e->type = type;
         e->exprs = exprs;
         e->work_dirty = work_dirty;
@@ -373,11 +431,16 @@ struct expr_t { /* NOLINT */
         return e;
     }
 
+    virtual uptrexpr_t copy_shallow() const {
+        return base_copy_shallow<expr_t>();
+    }
+
     /* walks (deep copy)
      * does not copy parent
      */
-    virtual uptrexpr_t copy() const {
-        uptrexpr_t e = std::make_unique<expr_t>();
+    template <typename T>
+    uptrexpr_t base_copy() const {
+        uptrexpr_t e(dynamic_cast<expr_t*>(new T));
         e->type = type;
         e->exprs.resize(exprs.size());
         for (std::size_t i = 0; i < exprs.size(); i++) {
@@ -394,6 +457,10 @@ struct expr_t { /* NOLINT */
         return e;
     }
 
+    virtual uptrexpr_t copy() const {
+        return base_copy<expr_t>();
+    }
+
     void walk(const std::function<void (sptrexpr_t&)> &f) {
         for (sptrexpr_t &expr : exprs) {
             f(expr);
@@ -408,12 +475,28 @@ struct expr_t { /* NOLINT */
         }
     }
 
+    void get_deepest_type_stacks(std::vector<std::vector<etype_t>> &out, std::vector<etype_t> &cur) const {
+        cur.push_back(type);
+        if (exprs.empty()) {
+            out.push_back(cur);
+            return;
+        }
+        for (const sptrexpr_t &e : exprs) {
+            e->get_deepest_type_stacks(out, cur);
+        }
+        cur.erase(cur.end() - 1);
+    }
+
     /* walks */
     std::uint32_t size() const {
         std::uint32_t sum = 1;
         walk_const([&sum](const sptrexpr_t &expr) { sum += expr->size() + 1; });
         return sum;
     }
+
+    double dist_randgen(const expr_t &other, std::size_t sample_size) const;
+
+    double dist_match(const expr_t &other) const;
 
     /* dist are between 0 and 1 */
     double dist(const expr_t &other, std::size_t sample_size) const;
@@ -458,27 +541,37 @@ struct expr_t { /* NOLINT */
      * otherwise should return an objexpr_t, with ALL (recursive) child exprs also objexpr_t - this is the only valid calcuated form (note we don't say "closed form" - it is more subjective and hazy, it depends on the context)
      * it is up to each derived expr_t class to determine precision requirements (DEAL WITH IT!!!)
      */
-    virtual std::optional<uptrexpr_t> calculate() const;
+    virtual std::optional<uptrexpr_t> calculate() const {
+        return {};
+    }
 
-    virtual uptrexpr_t generate() const;
+    virtual uptrexpr_t generate() const {
+        return copy();
+    }
 
     virtual std::string disp() const {
         return "_" + etype_to_str.at(type);
     }
 };
 
+void expr_add_expr(const sptrexpr_t &parent, const sptrexpr_t &expr) {
+    expr->parents.push_back(parent);
+    parent->exprs.push_back(expr);
+}
+
+
 /* copies */
 template <typename T>
 std::unique_ptr<T> from_expr_copy(const uptrexpr_t &e) {
     uptrexpr_t c = e->copy();
-    return std::unique_ptr<T>(dynamic_cast<T*>(c.release()));
+    return std::unique_ptr<T>(static_cast<T*>(c.release()));
 }
 
 /* copies */
 template <typename T>
 std::shared_ptr<T> from_expr_copy(const sptrexpr_t &e) {
     uptrexpr_t c = e->copy();
-    return std::unique_ptr<T>(dynamic_cast<T*>(c.release()));
+    return std::unique_ptr<T>(static_cast<T*>(c.release()));
 }
 
 /* moves (releases pointer) */
@@ -490,8 +583,11 @@ uptrexpr_t to_expr(std::unique_ptr<T> &e) {
 /* moves (releases pointer) */
 template <typename T>
 std::unique_ptr<T> from_expr(uptrexpr_t &e) {
-    return std::unique_ptr<T>(dynamic_cast<T*>(e.release()));
+    auto t1 = e.release();
+    auto t2 = dynamic_cast<T*>(t1);
+    return std::unique_ptr<T>(t2);
 }
+
 
 struct objexpr_t : virtual expr_t {
     obj_t obj;
@@ -501,10 +597,21 @@ struct objexpr_t : virtual expr_t {
     uptrexpr_t copy_shallow() const override;
     uptrexpr_t copy() const override;
 
+    objexpr_t() {
+        type = etype_t::objexpr_t;
+    }
+
     ~objexpr_t() override {
         if (obj.type == otype_t::int_v) {
-            mpz_clear(std::get<mpz_t>(obj.v));
+            mpz_clear(std::get<mpzw_t>(obj.v).z);
         }
+    }
+
+    std::optional<uptrexpr_t> calculate() const override {
+        if (obj.name.has_value() && obj.v.index() == 0) {
+            return {};
+        }
+        return copy();
     }
 
     /* dist are between 0 and 1 */
@@ -514,10 +621,10 @@ struct objexpr_t : virtual expr_t {
             case otype_t::bool_v:
                 return static_cast<double>(std::get<bool>(obj.v) != std::get<bool>(other.obj.v));
             case otype_t::int_v: {
-                mpz_t diff;
-                mpz_sub(diff, std::get<mpz_t>(obj.v), std::get<mpz_t>(other.obj.v));
-                mpz_abs(diff, diff);
-                return mpz_compress_double(diff);
+                mpzw_t diff{};
+                mpz_sub(diff.z, std::get<mpzw_t>(obj.v).z, std::get<mpzw_t>(other.obj.v).z);
+                mpz_abs(diff.z, diff.z);
+                return mpzs_compress_double(diff);
             }
             case otype_t::dec_v: {
                 dec_t a = std::get<dec_t>(obj.v) - std::get<dec_t>(other.obj.v);
@@ -537,31 +644,49 @@ struct objexpr_t : virtual expr_t {
                 return 1.0;
         }
     }
+
+    std::string disp() const override {
+        switch (obj.type) {
+            case otype_t::bool_v:
+                return (std::get<bool>(obj.v) ? "true" : "false");
+            case otype_t::int_v: {
+                char *s = nullptr;
+                gmp_asprintf(&s, "%Zd", std::get<mpzw_t>(obj.v).z);
+                std::string rs(s);
+                free(s); /* NOLINT */
+                return rs;
+            }
+            case otype_t::dec_v:
+                return std::get<dec_t>(obj.v).toString();
+            case otype_t::none:
+                return "_noneobj";
+            default:
+                return "";
+        }
+    }
 };
 
-using sptrobjexpr_t = std::shared_ptr<objexpr_t>;
-using wptrobjexpr_t = std::weak_ptr<objexpr_t>;
-using uptrobjexpr_t = std::unique_ptr<objexpr_t>;
 
 uptrexpr_t objexpr_t::copy_shallow() const {
-    uptrexpr_t e = expr_t::copy_shallow();
+    uptrexpr_t e = base_copy_shallow<objexpr_t>();
     uptrobjexpr_t oe = from_expr<objexpr_t>(e);
     if (obj.type == otype_t::int_v) {
-        oe->obj.v = mpz_t{};
-        auto &nz = std::get<mpz_t>(oe->obj.v);
-        mpz_init_set(nz, std::get<mpz_t>(obj.v));
+        oe->obj.v = mpzw_t{};
+        auto &nz = std::get<mpzw_t>(oe->obj.v);
+        mpz_init_set(nz.z, std::get<mpzw_t>(obj.v).z);
     } else {
         oe->obj = obj;
     }
 }
 
 uptrexpr_t objexpr_t::copy() const {
-    uptrexpr_t e = expr_t::copy();
+    uptrexpr_t e = base_copy<objexpr_t>();
     uptrobjexpr_t oe = from_expr<objexpr_t>(e);
+    oe->obj.type = obj.type;
     if (obj.type == otype_t::int_v) {
-        oe->obj.v = mpz_t{};
-        auto &nz = std::get<mpz_t>(oe->obj.v);
-        mpz_init_set(nz, std::get<mpz_t>(obj.v));
+        oe->obj.v = mpzw_t{};
+        auto &nz = std::get<mpzw_t>(oe->obj.v);
+        mpz_init_set(nz.z, std::get<mpzw_t>(obj.v).z);
     } else {
         oe->obj = obj;
     }
@@ -570,21 +695,34 @@ uptrexpr_t objexpr_t::copy() const {
 
 uptrobjexpr_t make_bool(bool v) {
     uptrobjexpr_t oe = std::make_unique<objexpr_t>();
-    oe->obj = obj_t{.type = otype_t::bool_v, .v = v};
+    oe->obj.type = otype_t::bool_v;
+    oe->obj.v = v;
     return oe;
 }
 
-uptrobjexpr_t make_mpz(mpz_t i) {
+/* uses mpz_init_set to copy */
+uptrobjexpr_t make_mpzs_copy(mpzw_t i) {
     uptrobjexpr_t oe = std::make_unique<objexpr_t>();
-    oe->obj = obj_t{.type = otype_t::int_v, .v = mpz_t{}};
-    auto &tz = std::get<mpz_t>(oe->obj.v);
-    mpz_init_set(tz, i);
+    oe->obj.type = otype_t::int_v;
+    oe->obj.v = mpzw_t{};
+    auto &tz = std::get<mpzw_t>(oe->obj.v);
+    mpz_init_set(tz.z, i.z);
+    return oe;
+}
+
+/* steals mpz */
+uptrobjexpr_t make_mpzs(mpzw_t i) {
+    uptrobjexpr_t oe = std::make_unique<objexpr_t>();
+    oe->obj.type = otype_t::int_v;
+    oe->obj.v = mpzw_t{};
+    std::get<mpzw_t>(oe->obj.v) = i;
     return oe;
 }
 
 uptrobjexpr_t make_dec(const dec_t &a) {
     uptrobjexpr_t oe = std::make_unique<objexpr_t>();
-    oe->obj = obj_t{.type = otype_t::dec_v, .v = a};
+    oe->obj.type = otype_t::dec_v;
+    oe->obj.v = a;
     return oe;
 }
 
@@ -594,10 +732,10 @@ uptrexpr_t objexpr_t::generate() const {
         case otype_t::bool_v:
             return make_bool(get_random_int<bool>(false, true));
         case otype_t::int_v: {
-            mpz_t a;
-            mpz_init(a);
-            mpz_geometric_dist(a);
-            return make_mpz(a);
+            mpzw_t a{};
+            mpz_init(a.z);
+            mpzs_geometric_dist(a);
+            return make_mpzs_copy(a);
         }
         case otype_t::dec_v: {
             dec_t a;
@@ -615,27 +753,96 @@ uptrexpr_t objexpr_t::generate() const {
     }
 }
 
-double expr_t::dist(const expr_t &other, std::size_t sample_size = 20) const {
+struct addexpr_t : virtual expr_t {
+
+    addexpr_t() {
+        type = etype_t::addexpr_t;
+    }
+
+    std::optional<uptrexpr_t> calculate() const override {
+        std::variant<mpzw_t, dec_t> sum = mpzw_t{};
+        mpz_init(std::get<mpzw_t>(sum).z);
+        for (const sptrexpr_t &expr : exprs) {
+            if (expr->type != etype_t::objexpr_t) {
+                return {};
+            }
+            std::optional<uptrexpr_t> res = expr->calculate();
+            if (res.has_value()) {
+                uptrobjexpr_t ores = from_expr<objexpr_t>(res.value());
+                if (sum.index() == 0) { /* is mpz */
+                    if (ores->obj.type == otype_t::dec_v) {
+                        dec_t tmp = dec_t(std::get<mpzw_t>(sum).z);
+                        sum = tmp + std::get<dec_t>(ores->obj.v);
+                    } else if (ores->obj.type == otype_t::int_v) {
+                        mpz_add(std::get<mpzw_t>(sum).z, std::get<mpzw_t>(sum).z, std::get<mpzw_t>(ores->obj.v).z);
+                    } else {
+                        return {};
+                    }
+                } else if (sum.index() == 1) { /* is dec */
+                    if (ores->obj.type == otype_t::dec_v) {
+                        std::get<dec_t>(sum) += std::get<dec_t>(ores->obj.v);
+                    } else if (ores->obj.type == otype_t::int_v) {
+                        std::get<dec_t>(sum) += std::get<mpzw_t>(ores->obj.v).z;
+                    } else {
+                        return {};
+                    }
+                }
+            } else {
+                return {};
+            }
+        }
+        uptrobjexpr_t r = std::make_unique<objexpr_t>();
+        if (sum.index() == 0) { /* is mpz */
+            r->obj.v = std::get<mpzw_t>(sum);
+            r->obj.type = otype_t::int_v;
+        } else if (sum.index() == 1) { /* is dec_t */
+            r->obj.v = std::get<dec_t>(sum);
+            r->obj.type = otype_t::dec_v;
+        }
+        return r;
+    }
+
+    std::string disp() const override {
+        std::stringstream s;
+        for (std::size_t i = 0; i < exprs.size() - 1; i++) {
+            s << exprs[i]->disp();
+            s << " + ";
+        }
+        if (!exprs.empty()) {
+            s << exprs[exprs.size() - 1]->disp();
+            return s.str();
+        }
+        return "_addexpr";
+    }
+};
+
+DEF_ALL_PTRS(addexpr_t);
+
+static constexpr std::size_t randgen_default_sample_size = 10;
+
+double expr_t::dist_randgen(const expr_t &other, std::size_t sample_size = randgen_default_sample_size) const {
     sptrexpr_t e = copy(), o = other.copy();
     /* first we collect all objs */
     std::vector<sptrobjexpr_t> all_objs_e;
-    e->walk_const([&all_objs_e](const sptrexpr_t &texpr) {
+    /* TODO: !!!!! fix these pointer casts */
+    /* e->walk_const([&all_objs_e](const sptrexpr_t &texpr) {
         if (texpr->type == etype_t::objexpr_t && texpr->exprs.empty()) {
-            sptrobjexpr_t tobjexpr = std::static_pointer_cast<objexpr_t>(texpr);
+            sptrobjexpr_t tobjexpr = from_expr_copy<objexpr_t>(texpr);
             if (tobjexpr->obj.name.has_value()) {
-                all_objs_e.push_back(tobjexpr);
+                all_objs_e.push_back(from_expr<objexpr_t>(texpr));
             }
         }
-    });
+    }); */
     std::vector<sptrobjexpr_t> all_objs_o;
-    o->walk_const([&all_objs_o](const sptrexpr_t &texpr) {
+    /* TODO: !!!!! fix these pointer casts */
+    /* o->walk_const([&all_objs_o](const sptrexpr_t &texpr) {
         if (texpr->type == etype_t::objexpr_t && texpr->exprs.empty()) {
             sptrobjexpr_t tobjexpr = std::static_pointer_cast<objexpr_t>(texpr);
             if (tobjexpr->obj.name.has_value()) {
                 all_objs_o.push_back(tobjexpr);
             }
         }
-    });
+    }); */
 
     auto objnamecomp = [](const sptrobjexpr_t &a, const sptrobjexpr_t &b) {
         return a->obj.name.value() < b->obj.name.value();
@@ -713,14 +920,53 @@ double expr_t::dist(const expr_t &other, std::size_t sample_size = 20) const {
     return dsum / static_cast<double>(samples_taken);
 }
 
+double expr_t::dist_match(const expr_t &other) const {
+    std::vector<std::vector<etype_t>> stacks, ostacks;
+    std::vector<etype_t> tmp_cur, otmp_cur;
+    get_deepest_type_stacks(stacks, tmp_cur);
+    other.get_deepest_type_stacks(ostacks, otmp_cur);
+    double simsum = 0.0;
+    std::size_t simcnt = stacks.size() * ostacks.size();
+    for (const std::vector<etype_t> &tstack : stacks) {
+        for (const std::vector<etype_t> &ostack : ostacks) {
+            simsum += vec_similarity(tstack, ostack);
+        }
+    }
+    double avg = 1.0;
+    if (simcnt > 0) {
+        avg = simsum/static_cast<double>(simcnt);
+    }
+    return avg;
+}
+
+double expr_t::dist(const expr_t &other, std::size_t sample_size = randgen_default_sample_size) const {
+    double m = dist_match(other);
+    double rd = dist_randgen(other, sample_size);
+    return std::sqrt(m * m + rd * rd);
+}
+
 
 int main() {
     gmp_randinit_default(randstate);
 
-    void *dlhandle = dlopen(WORK_SO_FILENAME, RTLD_LAZY);
-    expr_work = reinterpret_cast<decltype(expr_work)>(dlsym(dlhandle, "expr_work")); /* NOLINT */
-    if (expr_work == nullptr) {
-        ERR_EXIT(1, "could not resolve expr_work from shared object " WORK_SO_FILENAME);
-    }
-    dlclose(dlhandle);
+    // void *dlhandle = dlopen(WORK_SO_FILENAME, RTLD_LAZY);
+    // expr_work = reinterpret_cast<decltype(expr_work)>(dlsym(dlhandle, "expr_work")); /* NOLINT */
+    // if (expr_work == nullptr) {
+    //     ERR_EXIT(1, "could not resolve expr_work from shared object " WORK_SO_FILENAME);
+    // }
+    // dlclose(dlhandle);
+
+    mpzw_t i{};
+    mpz_init_set_ui(i.z, 3);
+    sptrobjexpr_t three = make_mpzs_copy(i);
+    mpz_set_ui(i.z, 2);
+    sptrobjexpr_t two = make_mpzs(i);
+    sptraddexpr_t a = std::make_unique<addexpr_t>();
+    expr_add_expr(a, two);
+    expr_add_expr(a, three);
+    uptrexpr_t res = a->load(true);
+    uptrobjexpr_t ores = from_expr<objexpr_t>(res);
+    std::cout << a->disp() << " loaded to " << ores->disp() << std::endl;
+
+    gmp_randclear(randstate);
 }
