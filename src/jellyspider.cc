@@ -405,7 +405,7 @@ enum struct etype_t : std::uint16_t {
 
 struct expr_t;
 
-DEF_PTRS(expr)
+DEF_PTRS(expr);
 
 struct thm_t;
 
@@ -544,7 +544,7 @@ std::shared_ptr<T> from_expr(sptrexpr_t e) {
 
 struct objexpr_t;
 
-DEF_PTRS(objexpr)
+DEF_PTRS(objexpr);
 
 /* NOLINTBEGIN */
 
@@ -682,9 +682,9 @@ struct expr_t { /* NOLINT */
     /* dist are between 0 and 1 */
     double dist(const expr_t &other, std::size_t sample_size) const;
 
-    std::wstring disp_to_str() const {
+    std::wstring disp_to_str(const std::optional<wptrexpr_t> &parent = {}) const {
         std::wstringstream s;
-        disp(s);
+        disp(s, parent);
         return s.str();
     }
 
@@ -737,40 +737,36 @@ struct expr_t { /* NOLINT */
     }
 
     /* checks if needs paren */
-    void disp_exprs_sep(std::wostream &os, const std::wstring &sep) const {
+    void disp_exprs_sep(std::wostream &os, const std::wstring &sep, const decltype(exprs)::const_iterator &begin, const decltype(exprs)::const_iterator &end) const {
         if (exprs.empty()) {
             return;
         }
-        for (std::size_t i = 0; i < exprs.size() - 1; i++) {
-            bool np = exprs[i]->disp_needs_paren();
-            if (np) {
-                os << '(';
-            }
-            exprs[i]->disp(os);
-            if (np) {
-                os << ')';
-            }
+        for (auto i = begin; i != end - 1; i++) {
+            (*i)->disp_check_paren(os, self);
             os << sep;
         }
-        bool np = exprs[exprs.size() - 1]->disp_needs_paren();
+        (*(end - 1))->disp_check_paren(os, self);
+    }
+
+    void disp_check_paren(std::wostream &os, const std::optional<wptrexpr_t> &parent) const {
+        bool np = disp_needs_paren(parent);
         if (np) {
-            os << '(';
+            os << L'(';
         }
-        exprs[exprs.size() - 1]->disp(os);
+        disp(os, parent);
         if (np) {
-            os << ')';
+            os << L')';
         }
     }
 
-    /* this returns false by default because the default disp always wraps in _exprtypeN{...} */
-    virtual bool disp_needs_paren() const {
-        return false;
+    virtual bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const {
+        return true;
     }
 
-    virtual void disp(std::wostream &os) const {
-        os << L"_exprtype" << static_cast<std::uint16_t>(type) << '{';
-        disp_exprs_sep(os, L", ");
-        os << '}';
+    virtual void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const {
+        os << L"_exprtype" << static_cast<std::uint16_t>(type) << L'{';
+        disp_exprs_sep(os, L", ", exprs.begin(), exprs.end());
+        os << L'}';
     }
 };
 
@@ -836,11 +832,15 @@ struct objexpr_t : virtual expr_t {
         }
     }
 
-    bool disp_needs_paren() const override {
+    bool is_ref_obj() const {
+        return obj.name.has_value() && exprs.empty() && obj.v.index() == 0;
+    }
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
         return false;
     }
 
-    void disp(std::wostream &os) const override {
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
         switch (obj.type) {
             case otype_t::bool_v:
                 os << (std::get<bool>(obj.v) ? L"true" : L"false");
@@ -856,19 +856,44 @@ struct objexpr_t : virtual expr_t {
             case otype_t::dec_v:
                 os << str_to_wstr(std::get<dec_t>(obj.v).toString());
                 return;
+            case otype_t::map_t:
+                os << obj.name.value();
+                return;
+            case otype_t::set_t:
+                os << L'{';
+                disp_exprs_sep(os, L", ", exprs.begin(), exprs.end());
+                os << L'}';
+                return;
+            case otype_t::tuple_t:
+                os << L'(';
+                disp_exprs_sep(os, L", ", exprs.begin(), exprs.end());
+                os << L')';
+                return;
+            case otype_t::symbol_t:
+                os << L'\\';
+                os << obj.name.value();
+                os << L' ';
+                return;
+            case otype_t::unresolvable_t:
+                os << L"_unresolvable";
+                return;
             case otype_t::none:
-                os << L"_noneobj";
+                if (is_ref_obj()) {
+                    os << obj.name.value();
+                } else {
+                    os << L"_noneobj";
+                }
                 return;
             default:
-                os << L"_objexprtype" << static_cast<std::uint16_t>(otype_t::bool_v) << '{';
-                disp_exprs_sep(os, L", ");
+                os << L"_objexprtype" << static_cast<std::uint16_t>(obj.type) << '{';
+                disp_exprs_sep(os, L", ", exprs.begin(), exprs.end());
                 os << '}';
                 return;
         }
     }
 };
 
-DEF_PTRFUN(objexpr)
+DEF_PTRFUN(objexpr);
 
 void expr_add_expr(const sptrexpr_t &parent, const sptrexpr_t &expr) {
     if (expr->type == etype_t::objexpr_t) {
@@ -1006,12 +1031,13 @@ sptrexpr_t objexpr_t::generate() const {
 
 struct mapdefexpr_t;
 
-DEF_PTRS(mapdefexpr)
+DEF_PTRS(mapdefexpr);
 
 std::unordered_map<std::wstring, wptrmapdefexpr_t> funcdefs; /* NOLINT */
 
 struct mapdefexpr_t : virtual expr_t {
-    std::wstring func_name, param_name;
+    std::wstring func_name;
+    std::vector<std::wstring> param_names;
 
     sptrexpr_t func_body() {
         return exprs[2];
@@ -1020,6 +1046,34 @@ struct mapdefexpr_t : virtual expr_t {
     mapdefexpr_t() {
         type = etype_t::mapdefexpr_t;
     }
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return true;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        os << L"\\map ";
+        os << func_name;
+        os << L": ";
+        exprs[0]->disp(os, self);
+        os << L" -> ";
+        exprs[1]->disp(os, self);
+        os << L" := ";
+        if (param_names.size() > 1) {
+            os << L'(';
+        }
+        for (std::size_t i = 0; i < param_names.size() - 1; i++) {
+            os << param_names[i] << L", ";
+        }
+        if (!param_names.empty()) {
+            os << param_names[param_names.size() - 1];
+        }
+        if (param_names.size() > 1) {
+            os << L')';
+        }
+        os << L" -> ";
+        exprs[2]->disp(os, self);
+    }
 };
 
 /* assumes funcdefs does not already have md.lock()->func_name */
@@ -1027,7 +1081,7 @@ void expr_add_to_defs(const wptrmapdefexpr_t &md) {
     funcdefs[md.lock()->func_name] = md;
 }
 
-DEF_PTRFUN(mapdefexpr)
+DEF_PTRFUN(mapdefexpr);
 
 struct mapcallexpr_t : virtual expr_t {
 
@@ -1042,38 +1096,56 @@ struct mapcallexpr_t : virtual expr_t {
         }
         sptrexpr_t &fnres = ofnres.value();
         if (fnres->type != etype_t::objexpr_t) {
-            ERR_EXIT(1, "referenced function in mapcallexpr_t did not calculate to an objexpr_t, was %s", wstr_to_str(fnres->disp_to_str()).c_str());
+            ERR_EXIT(1, "mapcallexpr_t: referenced function did not calculate to an objexpr_t, was %s", wstr_to_str(fnres->disp_to_str()).c_str());
         }
         sptrobjexpr_t fn = from_expr<objexpr_t>(std::move(fnres));
         if (!fn->obj.name.has_value()) {
-            ERR_EXIT(1, "referenced function in mapcallexpr_t calculated to an anonymous objexpr_t, was %s", wstr_to_str(fnres->disp_to_str()).c_str());
+            ERR_EXIT(1, "mapcallexpr_t: referenced function calculated to an anonymous objexpr_t, was %s", wstr_to_str(fnres->disp_to_str()).c_str());
         }
         if (!funcdefs.contains(fn->obj.name.value())) {
-            ERR_EXIT(1, "referenced function in mapcallexpr_t calculated to a function name which was not defined previously, was %s", wstr_to_str(fn->obj.name.value()).c_str());
+            ERR_EXIT(1, "mapcallexpr_t: referenced function calculated to a function name which was not defined previously, was %s", wstr_to_str(fn->obj.name.value()).c_str());
         }
         wptrmapdefexpr_t mapdef = funcdefs[fn->obj.name.value()];
         if (mapdef.expired()) {
-            ERR_EXIT(1, "referenced function in mapcallexpr_t calculated to function name %s which was in funcdefs but with expired wptrmapdefexpr_t", wstr_to_str(fn->obj.name.value()).c_str());
+            ERR_EXIT(1, "mapcallexpr_t: referenced function calculated to function name %s which was in funcdefs but with expired wptrmapdefexpr_t", wstr_to_str(fn->obj.name.value()).c_str());
         }
         sptrexpr_t fnbody = mapdef.lock()->func_body()->copy();
-        for (const auto &[obj, parent] : fnbody->all_objs) {
-            if (obj.expired()) {
-                continue;
-            }
-            if (obj.lock()->obj.name.has_value()) {
-                if (obj.lock()->obj.name.value() == mapdef.lock()->param_name) {
-                    sptrexpr_t sparent = parent.lock();
-                    std::replace(sparent->exprs.begin(), sparent->exprs.end(), to_expr(obj.lock()), exprs[1]);
-                    sparent->signal_dirty();
+        if (mapdef.lock()->param_names.size() != exprs.size() - 1) {
+            ERR_EXIT(1, "mapcallexpr_t: incorrect number of parameters passed to function name %s, expected %zu, got %zu", wstr_to_str(fn->obj.name.value()).c_str(), mapdef.lock()->param_names.size(), exprs.size() - 1);
+        }
+        for (std::size_t pi = 0; pi < mapdef.lock()->param_names.size(); pi++) {
+            const std::wstring &param_name = mapdef.lock()->param_names[pi];
+            for (const auto &[obj, parent] : fnbody->all_objs) {
+                if (obj.expired()) {
+                    continue;
+                }
+                if (obj.lock()->obj.name.has_value()) {
+                    if (obj.lock()->obj.name.value() == param_name) {
+                        sptrexpr_t sparent = parent.lock();
+                        std::replace(sparent->exprs.begin(), sparent->exprs.end(), to_expr(obj.lock()), exprs[pi + 1]);
+                        sparent->signal_dirty();
+                    }
                 }
             }
         }
         return fnbody->calculate();
     }
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return true;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        os << L"\\call ";
+        exprs[0]->disp(os, self);
+        os << L'(';
+        disp_exprs_sep(os, L", ", exprs.begin() + 1, exprs.end());
+        os << L')';
+    }
 };
 
-DEF_PTRS(mapcallexpr)
-DEF_PTRFUN(mapcallexpr)
+DEF_PTRS(mapcallexpr);
+DEF_PTRFUN(mapcallexpr);
 
 struct addexpr_t : virtual expr_t {
     addexpr_t() {
@@ -1084,33 +1156,32 @@ struct addexpr_t : virtual expr_t {
         std::variant<mpzw_t, dec_t> sum = mpzw_t{};
         mpz_init(std::get<mpzw_t>(sum).z);
         for (const sptrexpr_t &expr : exprs) {
-            if (expr->type != etype_t::objexpr_t) {
+            std::optional<sptrexpr_t> res = expr->calculate();
+            if (!res.has_value()) {
                 return {};
             }
-            std::optional<sptrexpr_t> res = expr->calculate();
-            if (res.has_value()) {
-                sptrobjexpr_t ores = from_expr<objexpr_t>(std::move(res.value()));
-                if (sum.index() == 0) { /* is mpz */
-                    if (ores->obj.type == otype_t::dec_v) {
-                        dec_t tmp = dec_t(std::get<mpzw_t>(sum).z);
-                        mpz_clear(std::get<mpzw_t>(sum).z);
-                        sum = tmp + std::get<dec_t>(ores->obj.v);
-                    } else if (ores->obj.type == otype_t::int_v) {
-                        mpz_add(std::get<mpzw_t>(sum).z, std::get<mpzw_t>(sum).z, std::get<mpzw_t>(ores->obj.v).z);
-                    } else {
-                        return {};
-                    }
-                } else if (sum.index() == 1) { /* is dec */
-                    if (ores->obj.type == otype_t::dec_v) {
-                        std::get<dec_t>(sum) += std::get<dec_t>(ores->obj.v);
-                    } else if (ores->obj.type == otype_t::int_v) {
-                        std::get<dec_t>(sum) += std::get<mpzw_t>(ores->obj.v).z;
-                    } else {
-                        return {};
-                    }
+            if (res.value()->type != etype_t::objexpr_t) {
+                return {}; /* TODO: should this error? */
+            }
+            sptrobjexpr_t ores = from_expr<objexpr_t>(std::move(res.value()));
+            if (sum.index() == 0) { /* is mpz */
+                if (ores->obj.type == otype_t::dec_v) {
+                    dec_t tmp = dec_t(std::get<mpzw_t>(sum).z);
+                    mpz_clear(std::get<mpzw_t>(sum).z);
+                    sum = tmp + std::get<dec_t>(ores->obj.v);
+                } else if (ores->obj.type == otype_t::int_v) {
+                    mpz_add(std::get<mpzw_t>(sum).z, std::get<mpzw_t>(sum).z, std::get<mpzw_t>(ores->obj.v).z);
+                } else {
+                    return {}; /* TODO: should this error? */
                 }
-            } else {
-                return {};
+            } else if (sum.index() == 1) { /* is dec */
+                if (ores->obj.type == otype_t::dec_v) {
+                    std::get<dec_t>(sum) += std::get<dec_t>(ores->obj.v);
+                } else if (ores->obj.type == otype_t::int_v) {
+                    std::get<dec_t>(sum) += std::get<mpzw_t>(ores->obj.v).z;
+                } else {
+                    return {}; /* TODO: should this error? */
+                }
             }
         }
         sptrobjexpr_t r = make_objexpr();
@@ -1126,21 +1197,668 @@ struct addexpr_t : virtual expr_t {
 
     sptrexpr_t copy() const override;
 
-    bool disp_needs_paren() const override {
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
         return exprs.size() > 1;
     }
 
-    void disp(std::wostream &os) const override {
-        disp_exprs_sep(os, L" + ");
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        disp_exprs_sep(os, L" + ", exprs.begin(), exprs.end());
     }
 };
 
-DEF_PTRS(addexpr)
-DEF_PTRFUN(addexpr)
+DEF_PTRS(addexpr);
+DEF_PTRFUN(addexpr);
 
 sptrexpr_t addexpr_t::copy() const {
     return base_copy<addexpr_t>();
 }
+
+struct negexpr_t : virtual expr_t {
+    negexpr_t() {
+        type = etype_t::negexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return true;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        os << L'-';
+        exprs[0]->disp_check_paren(os, parent);
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        std::optional<sptrexpr_t> ores = exprs[0]->calculate();
+        if (!ores.has_value()) {
+            return {};
+        }
+        sptrexpr_t res = ores.value();
+        if (res->type != etype_t::objexpr_t) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t oe = from_expr<objexpr_t>(res);
+        if (oe->obj.type == otype_t::int_v) {
+            auto &i = std::get<mpzw_t>(oe->obj.v);
+            mpz_neg(i.z, i.z);
+        } else if (oe->obj.type == otype_t::dec_v) {
+            auto &r = std::get<dec_t>(oe->obj.v);
+            mpfr_neg(r.mpfr_ptr(), r.mpfr_srcptr(), dec_t::get_default_rnd());
+        } else {
+            return {}; /* TODO: should this error? */
+        }
+        return oe;
+    }
+};
+
+sptrexpr_t negexpr_t::copy() const {
+    return base_copy<negexpr_t>();
+}
+
+DEF_PTRS(negexpr);
+DEF_PTRFUN(negexpr);
+
+
+struct subexpr_t : virtual expr_t {
+    subexpr_t() {
+        type = etype_t::subexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return exprs.size() > 1;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        disp_exprs_sep(os, L" - ", exprs.begin(), exprs.end());
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        std::variant<mpzw_t, dec_t> sum = mpzw_t{};
+        mpz_init(std::get<mpzw_t>(sum).z);
+        if (exprs.empty()) {
+            return make_mpzw(std::get<mpzw_t>(sum)); /* the mpzw should be 0 here, since we just init-ed */
+        }
+        std::optional<sptrexpr_t> res = exprs[0]->calculate();
+        if (!res.has_value()) {
+            return {};
+        }
+        if (res.value()->type != etype_t::objexpr_t) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t ores = from_expr<objexpr_t>(std::move(res.value()));
+        if (ores->obj.type == otype_t::dec_v) {
+            mpz_clear(std::get<mpzw_t>(sum).z);
+            sum = std::get<dec_t>(ores->obj.v);
+        } else if (ores->obj.type == otype_t::int_v) {
+            mpz_set(std::get<mpzw_t>(sum).z, std::get<mpzw_t>(ores->obj.v).z);
+        }
+        for (std::size_t i = 1; i < exprs.size(); i++) {
+            const sptrexpr_t &expr = exprs[i];
+            std::optional<sptrexpr_t> res = expr->calculate();
+            if (!res.has_value()) {
+                return {};
+            }
+            if (res.value()->type != etype_t::objexpr_t) {
+                return {}; /* TODO: should this error? */
+            }
+            sptrobjexpr_t ores = from_expr<objexpr_t>(std::move(res.value()));
+            if (sum.index() == 0) { /* is mpz */
+                if (ores->obj.type == otype_t::dec_v) {
+                    dec_t tmp = dec_t(std::get<mpzw_t>(sum).z);
+                    mpz_clear(std::get<mpzw_t>(sum).z);
+                    sum = tmp - std::get<dec_t>(ores->obj.v);
+                } else if (ores->obj.type == otype_t::int_v) {
+                    mpz_sub(std::get<mpzw_t>(sum).z, std::get<mpzw_t>(sum).z, std::get<mpzw_t>(ores->obj.v).z);
+                } else {
+                    return {}; /* TODO: should this error? */
+                }
+            } else if (sum.index() == 1) { /* is dec */
+                if (ores->obj.type == otype_t::dec_v) {
+                    std::get<dec_t>(sum) -= std::get<dec_t>(ores->obj.v);
+                } else if (ores->obj.type == otype_t::int_v) {
+                    std::get<dec_t>(sum) -= std::get<mpzw_t>(ores->obj.v).z;
+                } else {
+                    return {}; /* TODO: should this error? */
+                }
+            }
+        }
+        sptrobjexpr_t r = make_objexpr();
+        if (sum.index() == 0) { /* is mpz */
+            r->obj.v = std::get<mpzw_t>(sum);
+            r->obj.type = otype_t::int_v;
+        } else if (sum.index() == 1) { /* is dec_t */
+            r->obj.v = std::get<dec_t>(sum);
+            r->obj.type = otype_t::dec_v;
+        }
+        return r;
+    }
+};
+
+sptrexpr_t subexpr_t::copy() const {
+    return base_copy<subexpr_t>();
+}
+
+DEF_PTRS(subexpr);
+DEF_PTRFUN(subexpr);
+
+
+struct mulexpr_t : virtual expr_t {
+    mulexpr_t() {
+        type = etype_t::mulexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return exprs.size() > 1;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        disp_exprs_sep(os, L" * ", exprs.begin(), exprs.end());
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        std::variant<mpzw_t, dec_t> prod = mpzw_t{};
+        mpz_init_set_ui(std::get<mpzw_t>(prod).z, 1);
+        for (const sptrexpr_t &expr : exprs) {
+            std::optional<sptrexpr_t> res = expr->calculate();
+            if (!res.has_value()) {
+                return {};
+            }
+            if (res.value()->type != etype_t::objexpr_t) {
+                return {}; /* TODO: should this error? */
+            }
+            sptrobjexpr_t ores = from_expr<objexpr_t>(std::move(res.value()));
+            if (prod.index() == 0) { /* is mpz */
+                if (ores->obj.type == otype_t::dec_v) {
+                    dec_t tmp = dec_t(std::get<mpzw_t>(prod).z);
+                    mpz_clear(std::get<mpzw_t>(prod).z);
+                    prod = tmp * std::get<dec_t>(ores->obj.v);
+                } else if (ores->obj.type == otype_t::int_v) {
+                    mpz_mul(std::get<mpzw_t>(prod).z, std::get<mpzw_t>(prod).z, std::get<mpzw_t>(ores->obj.v).z);
+                } else {
+                    return {}; /* TODO: should this error? */
+                }
+            } else if (prod.index() == 1) { /* is dec */
+                if (ores->obj.type == otype_t::dec_v) {
+                    std::get<dec_t>(prod) *= std::get<dec_t>(ores->obj.v);
+                } else if (ores->obj.type == otype_t::int_v) {
+                    std::get<dec_t>(prod) *= std::get<mpzw_t>(ores->obj.v).z;
+                } else {
+                    return {}; /* TODO: should this error? */
+                }
+            }
+        }
+        sptrobjexpr_t r = make_objexpr();
+        if (prod.index() == 0) { /* is mpz */
+            r->obj.v = std::get<mpzw_t>(prod);
+            r->obj.type = otype_t::int_v;
+        } else if (prod.index() == 1) { /* is dec_t */
+            r->obj.v = std::get<dec_t>(prod);
+            r->obj.type = otype_t::dec_v;
+        }
+        return r;
+    }
+};
+
+sptrexpr_t mulexpr_t::copy() const {
+    return base_copy<mulexpr_t>();
+}
+
+DEF_PTRS(mulexpr);
+DEF_PTRFUN(mulexpr);
+
+
+struct divexpr_t : virtual expr_t {
+    divexpr_t() {
+        type = etype_t::divexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return exprs.size() > 1;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        disp_exprs_sep(os, L" / ", exprs.begin(), exprs.end());
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        if (exprs.size() > 2) { /* divexprs like this are ambiguous and we won't allow them */
+            ERR_EXIT(1, "divexpr_t: had too many sub expressions, expected at most 2, had %zu", exprs.size());
+        }
+        std::variant<mpzw_t, dec_t> prod = mpzw_t{};
+        mpz_init_set_ui(std::get<mpzw_t>(prod).z, 1);
+        if (exprs.empty()) {
+            return make_mpzw(std::get<mpzw_t>(prod)); /* the mpzw should be 1 here, since we just init and set */
+        }
+        std::optional<sptrexpr_t> res = exprs[0]->calculate();
+        if (!res.has_value()) {
+            return {};
+        }
+        if (res.value()->type != etype_t::objexpr_t) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t ores = from_expr<objexpr_t>(std::move(res.value()));
+        if (ores->obj.type == otype_t::dec_v) {
+            mpz_clear(std::get<mpzw_t>(prod).z);
+            prod = std::get<dec_t>(ores->obj.v);
+        } else if (ores->obj.type == otype_t::int_v) {
+            mpz_set(std::get<mpzw_t>(prod).z, std::get<mpzw_t>(ores->obj.v).z);
+        }
+
+        std::optional<sptrexpr_t> bres = exprs[1]->calculate();
+        if (!bres.has_value()) {
+            return {};
+        }
+        if (bres.value()->type != etype_t::objexpr_t) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t bores = from_expr<objexpr_t>(std::move(bres.value()));
+        if (prod.index() == 0) { /* is mpz */
+            if (bores->obj.type == otype_t::dec_v) {
+                dec_t tmp = dec_t(std::get<mpzw_t>(prod).z);
+                mpz_clear(std::get<mpzw_t>(prod).z);
+                prod = tmp / std::get<dec_t>(bores->obj.v);
+            } else if (bores->obj.type == otype_t::int_v) {
+                dec_t tmp = dec_t(std::get<mpzw_t>(prod).z);
+                mpz_clear(std::get<mpzw_t>(prod).z);
+                prod = tmp / std::get<mpzw_t>(bores->obj.v).z;
+            } else {
+                return {}; /* TODO: should this error? */
+            }
+        } else if (prod.index() == 1) { /* is dec */
+            if (bores->obj.type == otype_t::dec_v) {
+                std::get<dec_t>(prod) *= std::get<dec_t>(bores->obj.v);
+            } else if (bores->obj.type == otype_t::int_v) {
+                std::get<dec_t>(prod) *= std::get<mpzw_t>(bores->obj.v).z;
+            } else {
+                return {}; /* TODO: should this error? */
+            }
+        }
+        sptrobjexpr_t r = make_objexpr();
+        if (prod.index() == 0) { /* is mpz. this should be impossible but i'll leave the case here */
+            r->obj.v = std::get<mpzw_t>(prod);
+            r->obj.type = otype_t::int_v;
+        } else if (prod.index() == 1) { /* is dec_t */
+            r->obj.v = std::get<dec_t>(prod);
+            r->obj.type = otype_t::dec_v;
+        }
+        return r;
+    }
+};
+
+sptrexpr_t divexpr_t::copy() const {
+    return base_copy<divexpr_t>();
+}
+
+DEF_PTRS(divexpr);
+DEF_PTRFUN(divexpr);
+
+struct powexpr_t : virtual expr_t {
+    powexpr_t() {
+        type = etype_t::powexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return exprs.size() > 1;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        disp_exprs_sep(os, L" ^ ", exprs.begin(), exprs.end());
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        if (exprs.size() > 2) { /* powexprs like this are ambiguous and we won't allow them */
+            ERR_EXIT(1, "powexpr_t: had too many sub expressions, expected at most 2, had %zu", exprs.size());
+        }
+        if (exprs.empty()) { /* we also won't allow this */
+            ERR_EXIT(1, "powexpr_t: had no sub expressions, expected at least 1");
+        }
+        std::optional<sptrexpr_t> res = exprs[0]->calculate();
+        if (!res.has_value()) {
+            return {};
+        }
+        if (res.value()->type != etype_t::objexpr_t) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t ores = from_expr<objexpr_t>(res.value());
+        dec_t a;
+        if (ores->obj.type == otype_t::int_v) {
+            a = std::get<mpzw_t>(ores->obj.v).z;
+        } else if (ores->obj.type == otype_t::dec_v) {
+            a = std::get<dec_t>(ores->obj.v);
+        }
+        if (exprs.size() == 1) {
+            return make_dec(a);
+        }
+        std::optional<sptrexpr_t> bres = exprs[1]->calculate();
+        if (!bres.has_value()) {
+            return {};
+        }
+        if (bres.value()->type != etype_t::objexpr_t) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t bores = from_expr<objexpr_t>(bres.value());
+        dec_t b;
+        if (bores->obj.type == otype_t::int_v) {
+            b = std::get<mpzw_t>(bores->obj.v).z;
+        } else if (bores->obj.type == otype_t::dec_v) {
+            b = std::get<dec_t>(bores->obj.v);
+        }
+        mpfr_pow(a.mpfr_ptr(), a.mpfr_srcptr(), b.mpfr_srcptr(), dec_t::get_default_rnd());
+        return make_dec(a);
+    }
+};
+
+sptrexpr_t powexpr_t::copy() const {
+    return base_copy<powexpr_t>();
+}
+
+DEF_PTRS(powexpr);
+DEF_PTRFUN(powexpr);
+
+struct eqexpr_t : virtual expr_t {
+    eqexpr_t() {
+        type = etype_t::eqexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return exprs.size() > 1;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        disp_exprs_sep(os, L" = ", exprs.begin(), exprs.end());
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        if (exprs.empty()) {
+            ERR_EXIT(1, "eqexpr_t: had no sub expressions, expected at least 1");
+        }
+        sptrexpr_t orig = exprs[0];
+        for (std::size_t i = 1; i < exprs.size(); i++) {
+            const sptrexpr_t &expr = exprs[i];
+            std::optional<sptrexpr_t> res = expr->calculate();
+            if (!res.has_value()) {
+                return {};
+            }
+            if (*res.value() == *orig) { /* TODO: WORK ON!!! */
+                return make_bool(false); /* short circuit */
+            }
+        }
+        return make_bool(true);
+    }
+};
+
+sptrexpr_t eqexpr_t::copy() const {
+    return base_copy<eqexpr_t>();
+}
+
+DEF_PTRS(eqexpr);
+DEF_PTRFUN(eqexpr);
+
+
+struct andexpr_t : virtual expr_t {
+    andexpr_t() {
+        type = etype_t::andexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return exprs.size() > 1;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        disp_exprs_sep(os, L" \\and ", exprs.begin(), exprs.end());
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        if (exprs.empty()) {
+            ERR_EXIT(1, "andexpr_t: had no sub expressions, expected at least 1");
+        }
+        for (const sptrexpr_t &expr : exprs) {
+            std::optional<sptrexpr_t> res = expr->calculate();
+            if (!res.has_value()) {
+                return {};
+            }
+            if (res.value()->type != etype_t::objexpr_t) {
+                return {}; /* TODO: should this error? */
+            }
+            sptrobjexpr_t ores = from_expr<objexpr_t>(res.value());
+            if (ores->obj.type != otype_t::bool_v) {
+                return {}; /* TODO: should this error? */
+            }
+            if (!std::get<bool>(ores->obj.v)) {
+                return make_bool(false); /* short circuit */
+            }
+        }
+        return make_bool(true);
+    }
+};
+
+sptrexpr_t andexpr_t::copy() const {
+    return base_copy<andexpr_t>();
+}
+
+DEF_PTRS(andexpr);
+DEF_PTRFUN(andexpr);
+
+
+struct orexpr_t : virtual expr_t {
+    orexpr_t() {
+        type = etype_t::orexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return exprs.size() > 1;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        disp_exprs_sep(os, L" \\or ", exprs.begin(), exprs.end());
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        if (exprs.empty()) {
+            ERR_EXIT(1, "orexpr_t: had no sub expressions, expected at least 1");
+        }
+        for (const sptrexpr_t &expr : exprs) {
+            std::optional<sptrexpr_t> res = expr->calculate();
+            if (!res.has_value()) {
+                return {};
+            }
+            if (res.value()->type != etype_t::objexpr_t) {
+                return {}; /* TODO: should this error? */
+            }
+            sptrobjexpr_t ores = from_expr<objexpr_t>(res.value());
+            if (ores->obj.type != otype_t::bool_v) {
+                return {}; /* TODO: should this error? */
+            }
+            if (std::get<bool>(ores->obj.v)) {
+                return make_bool(true); /* short circuit */
+            }
+        }
+        return make_bool(false);
+    }
+};
+
+sptrexpr_t orexpr_t::copy() const {
+    return base_copy<orexpr_t>();
+}
+
+DEF_PTRS(orexpr);
+DEF_PTRFUN(orexpr);
+
+
+struct notexpr_t : virtual expr_t {
+    notexpr_t() {
+        type = etype_t::notexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return !exprs.empty();
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        os << L"\\not ";
+        exprs[0]->disp_check_paren(os, parent);
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        if (exprs.empty()) {
+            ERR_EXIT(1, "notexpr_t: had no sub expressions, expected exactly 1");
+        }
+        if (exprs.size() > 1) {
+            ERR_EXIT(1, "notexpr_t: had too many sub expressions, expected exactly 1, got %zu", exprs.size());
+        }
+        std::optional<sptrexpr_t> res = exprs[0]->calculate();
+        if (!res.has_value()) {
+            return {};
+        }
+        if (res.value()->type != etype_t::objexpr_t) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t ores = from_expr<objexpr_t>(res.value());
+        if (ores->obj.type != otype_t::bool_v) {
+            return {}; /* TODO: should this error? */
+        }
+        std::get<bool>(ores->obj.v) = !std::get<bool>(ores->obj.v);
+        return to_expr(ores);
+    }
+};
+
+sptrexpr_t notexpr_t::copy() const {
+    return base_copy<notexpr_t>();
+}
+
+DEF_PTRS(notexpr);
+DEF_PTRFUN(notexpr);
+
+struct containedexpr_t : virtual expr_t {
+    containedexpr_t() {
+        type = etype_t::containedexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return !exprs.empty();
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        exprs[0]->disp_check_paren(os, parent);
+        os << L" \\in ";
+        exprs[1]->disp_check_paren(os, parent);
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        if (exprs.size() < 2) {
+            ERR_EXIT(1, "containedexpr_t: had too little sub expressions, expected exactly 2, got %zu", exprs.size());
+        }
+        if (exprs.size() > 2) {
+            ERR_EXIT(1, "containedexpr_t: had too many sub expressions, expected exactly 2, got %zu", exprs.size());
+        }
+        std::optional<sptrexpr_t> res = exprs[0]->calculate();
+        std::optional<sptrexpr_t> setres = exprs[1]->calculate();
+        if (!res.has_value() || !setres.has_value()) {
+            return {};
+        }
+        if ((res.value()->type != etype_t::objexpr_t) || (setres.value()->type != etype_t::objexpr_t)) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t ores = from_expr<objexpr_t>(res.value());
+        sptrobjexpr_t osetres = from_expr<objexpr_t>(setres.value());
+        if (osetres->obj.type != otype_t::set_t) {
+            return {}; /* TODO: should this error? */
+        }
+        for (const sptrexpr_t &expr : osetres->exprs) { /* note expr should be an objexpr by calculate */
+            if (*from_expr<objexpr_t>(expr) == *ores) { /* TODO: WORK ON!!! */
+                return make_bool(true);
+            }
+        }
+        return make_bool(false);
+    }
+};
+
+sptrexpr_t containedexpr_t::copy() const {
+    return base_copy<containedexpr_t>();
+}
+
+DEF_PTRS(containedexpr);
+DEF_PTRFUN(containedexpr);
+
+
+
+
+struct tuplegetexpr_t : virtual expr_t {
+    tuplegetexpr_t() {
+        type = etype_t::tuplegetexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return !exprs.empty();
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        exprs[0]->disp_check_paren(os, self);
+        os << L'[';
+        exprs[1]->disp_check_paren(os, self);
+        os << L']';
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        if (exprs.size() < 2) {
+            ERR_EXIT(1, "tuplegetexpr_t: had too little sub expressions, expected exactly 2, got %zu", exprs.size());
+        }
+        if (exprs.size() > 2) {
+            ERR_EXIT(1, "tuplegetexpr_t: had too many sub expressions, expected exactly 2, got %zu", exprs.size());
+        }
+        std::optional<sptrexpr_t> res = exprs[0]->calculate();
+        std::optional<sptrexpr_t> indres = exprs[1]->calculate();
+        if (!res.has_value() || !indres.has_value()) {
+            return {};
+        }
+        if ((res.value()->type != etype_t::objexpr_t) || (indres.value()->type != etype_t::objexpr_t)) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t ores = from_expr<objexpr_t>(res.value());
+        sptrobjexpr_t oindres = from_expr<objexpr_t>(indres.value());
+        if (ores->obj.type != otype_t::tuple_t && oindres->obj.type != otype_t::int_v) {
+            return {}; /* TODO: should this error? */
+        }
+        auto &ind = std::get<mpzw_t>(oindres->obj.v);
+        if (mpz_cmp_ui(ind.z, ores->exprs.size()) >= 0) {
+            ERR_EXIT(1, "tuplegetexpr_t: expected index %s to be less than the tuple size %zu", wstr_to_str(oindres->disp_to_str()).c_str(), ores->exprs.size());
+        }
+        if (mpz_cmp_ui(ind.z, 0) < 0) {
+            ERR_EXIT(1, "tuplegetexpr_t: expected index %s to be greater than 0", wstr_to_str(oindres->disp_to_str()).c_str());
+        }
+        return ores->exprs[mpz_get_ui(ind.z)];
+    }
+};
+
+sptrexpr_t tuplegetexpr_t::copy() const {
+    return base_copy<tuplegetexpr_t>();
+}
+
+DEF_PTRS(tuplegetexpr);
+DEF_PTRFUN(tuplegetexpr);
+
+
 
 
 static constexpr std::size_t randgen_default_sample_size = 10;
@@ -1277,16 +1995,18 @@ int main() {
     expr_add_expr(fndef, domainset->copy());
     expr_add_expr(fndef, domainset);
     sptraddexpr_t fnbody = make_addexpr();
+    sptrnegexpr_t neg = make_negexpr();
     sptrobjexpr_t var = make_objexpr();
     var->obj.name = L"x";
-    expr_add_expr(fnbody, var);
+    expr_add_expr(neg, var);
+    expr_add_expr(fnbody, neg);
     mpzw_t i{};
     mpz_init_set_ui(i.z, 1);
     sptrobjexpr_t one = make_mpzw(i);
     expr_add_expr(fnbody, one);
     expr_add_expr(fndef, fnbody);
     fndef->func_name = L"f";
-    fndef->param_name = L"x";
+    fndef->param_names.emplace_back(L"x");
     expr_add_to_defs(fndef);
 
     /* call the function */
@@ -1298,7 +2018,12 @@ int main() {
     expr_add_expr(fncall, one->copy());
 
     sptrobjexpr_t ores = from_expr<objexpr_t>(fncall->calculate().value_or(make_objexpr()));
-    ores->disp(std::wcout);
+    std::wcout << "defined ";
+    fndef->disp(std::wcout, {});
+    std::wcout << std::endl;
+    fncall->disp(std::wcout, {});
+    std::wcout << " loaded to ";
+    ores->disp(std::wcout, {});
     std::wcout << std::endl;
 
     gmp_randclear(randstate);
