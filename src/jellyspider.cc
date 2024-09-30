@@ -263,10 +263,12 @@ enum struct otype_t : std::uint16_t {
 
     map_t,
 
-    set_t, tuple_t,
-    symbol_t,
+    set_t, /* {...} */
+    tuple_t, /* (...) */
 
-    unresolvable_t
+    symbol_t, /* \symbol name */
+
+    unresolvable_t /* \unresolvable */
 };
 
 /* name has value when it's an unspecified object - i.e. with .v as monostate 
@@ -344,14 +346,14 @@ struct bucket_avg_t {
 enum struct etype_t : std::uint16_t {
     none,
 
-    objexpr_t,
+    objexpr_t, /* check otype_t */
 
     /* number operations */
     addexpr_t, /* a + b + ... */
     negexpr_t, /* - b */
     subexpr_t, /* a - b - ... */
 
-    /* we will not support name smashing like ab to represent a*b, but we will support simply a b */
+    /* we will not support name smashing like ab to represent a*n, or a b */
     mulexpr_t, /* a * b * ... */
 
     divexpr_t, /* a / b */
@@ -398,8 +400,14 @@ enum struct etype_t : std::uint16_t {
     mapdefexpr_t, /* \map f: a -> b := x -> c */
 
     /* we store a weak ptr to the mapdefexpr_t for the function f. recall all names are global.
-     * at creation time, try to find the mapdefexpr_t for the function f */
-    mapcallexpr_t, /* \call f(x) */
+     * at creation time, try to find the mapdefexpr_t for the function f
+     * additionally, this only consumes one more expr. this expr can either be PARSED as
+     * 1. a tuple,
+     *    in which case each element of the tuple gets passed to f as expected
+     * 2. anything else,
+     *    in which case the expr gets passed as the first element to f
+     * note that mapcalls have the highest precedence in parsing */
+    mapcallexpr_t, /* f X */
 
 };
 
@@ -577,6 +585,35 @@ struct expr_t { /* NOLINT */
 
     void add_obj(const wptrobjexpr_t &o, const sptrexpr_t &parent);
 
+    void add(const sptrexpr_t &expr) {
+        if (expr->type == etype_t::objexpr_t) {
+            add_obj(std::dynamic_pointer_cast<objexpr_t>(expr), self.lock());
+        }
+        expr->parents.push_back(self);
+        exprs.emplace_back(expr);
+    }
+
+    template <typename T>
+    void add(const std::shared_ptr<T> &expr) {
+        if (expr->type == etype_t::objexpr_t) {
+            add_obj(std::dynamic_pointer_cast<objexpr_t>(expr), self.lock());
+        }
+        expr->parents.push_back(self);
+        exprs.emplace_back(to_expr(expr));
+    }
+
+    /* does not check any expired parents in expr->parents */
+    void del(const sptrexpr_t &expr) {
+        std::erase_if(expr->parents, [&](const wptrexpr_t &e) {
+            if (!e.expired()) {
+                return e.lock() == self.lock();
+            }
+            return false;
+        });
+        std::erase(exprs, expr);
+    }
+
+
     bool is_calc_form() const {
         if (type != etype_t::objexpr_t) { return false; }
         bool calc_form = true;
@@ -587,7 +624,9 @@ struct expr_t { /* NOLINT */
     }
 
     /* walks */
-    bool operator==(const expr_t &other) const;
+    bool operator==(const expr_t &other) const {
+        return false;
+    }
     /* {
         bool res = type == other.type;
         res = res && obj.has_value() == other.obj.has_value();
@@ -599,6 +638,7 @@ struct expr_t { /* NOLINT */
         }
         return res;
     } */
+
 
     /* walks (deep copy)
      * does not copy parent
@@ -895,51 +935,6 @@ struct objexpr_t : virtual expr_t {
 
 DEF_PTRFUN(objexpr);
 
-void expr_add_expr(const sptrexpr_t &parent, const sptrexpr_t &expr) {
-    if (expr->type == etype_t::objexpr_t) {
-        parent->add_obj(std::dynamic_pointer_cast<objexpr_t>(expr), parent);
-    }
-    expr->parents.push_back(parent);
-    parent->exprs.emplace_back(expr);
-}
-
-template <typename T>
-void expr_add_expr(const std::shared_ptr<T> &parent, const sptrexpr_t &expr) {
-    if (expr->type == etype_t::objexpr_t) {
-        parent->add_obj(std::dynamic_pointer_cast<objexpr_t>(expr), to_expr(parent));
-    }
-    expr->parents.push_back(to_expr(parent));
-    parent->exprs.emplace_back(expr);
-}
-
-template <typename T>
-void expr_add_expr(const sptrexpr_t &parent, const std::shared_ptr<T> &expr) {
-    if (expr->type == etype_t::objexpr_t) {
-        parent->add_obj(std::dynamic_pointer_cast<objexpr_t>(expr), parent);
-    }
-    expr->parents.push_back(parent);
-    parent->exprs.emplace_back(to_expr(expr));
-}
-
-template <typename T, typename U>
-void expr_add_expr(const std::shared_ptr<T> &parent, const std::shared_ptr<U> &expr) {
-    if (expr->type == etype_t::objexpr_t) {
-        parent->add_obj(std::dynamic_pointer_cast<objexpr_t>(expr), parent);
-    }
-    expr->parents.push_back(to_expr(parent));
-    parent->exprs.emplace_back(to_expr(expr));
-}
-
-/* does not check any expired parents in expr->parents */
-void expr_del_expr(sptrexpr_t &parent, const sptrexpr_t &expr) {
-    std::erase_if(expr->parents, [&](const wptrexpr_t &e) {
-        if (!e.expired()) {
-            return e.lock() == parent;
-        }
-        return false;
-    });
-    std::erase(parent->exprs, expr);
-}
 
 /* does not touch .parents or .exprs */
 void expr_t::add_obj(const wptrobjexpr_t &o, const sptrexpr_t &parent) {
@@ -1024,6 +1019,7 @@ sptrexpr_t objexpr_t::generate() const {
 
         /* TODO: work on these !! hard :( */
         case otype_t::set_t:
+        case otype_t::map_t:
         case otype_t::tuple_t:
             return copy();
     }
@@ -1775,7 +1771,7 @@ struct containedexpr_t : virtual expr_t {
         if (!res.has_value() || !setres.has_value()) {
             return {};
         }
-        if ((res.value()->type != etype_t::objexpr_t) || (setres.value()->type != etype_t::objexpr_t)) {
+        if ((res.value()->type != etype_t::objexpr_t) || (setres.value()->type != etype_t::objexpr_t)) { /* TODO: for now we require all to be obj sets here, but allow setgens in the future */
             return {}; /* TODO: should this error? */
         }
         sptrobjexpr_t ores = from_expr<objexpr_t>(res.value());
@@ -1858,7 +1854,216 @@ sptrexpr_t tuplegetexpr_t::copy() const {
 DEF_PTRS(tuplegetexpr);
 DEF_PTRFUN(tuplegetexpr);
 
+struct subsetexpr_t : virtual expr_t {
+    subsetexpr_t() {
+        type = etype_t::subsetexpr_t;
+    }
 
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return exprs.size() > 1;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        disp_exprs_sep(os, L" \\subset ", exprs.begin(), exprs.end());
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        return {}; /* TODO */
+    }
+};
+
+sptrexpr_t subsetexpr_t::copy() const {
+    return base_copy<subsetexpr_t>();
+}
+
+DEF_PTRS(subsetexpr);
+DEF_PTRFUN(subsetexpr);
+
+
+struct mapspecexpr_t : virtual expr_t {
+    mapspecexpr_t() {
+        type = etype_t::mapspecexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return true;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        exprs[0]->disp_check_paren(os, self);
+        os << L": ";
+        exprs[1]->disp_check_paren(os, self);
+        os << L" -> ";
+        exprs[2]->disp_check_paren(os, self);
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        if (exprs.size() != 3) {
+            ERR_EXIT(1, "mapspecexpr_t: expected 3 sub expressions, got %zu", exprs.size());
+        }
+
+        std::optional<sptrexpr_t> res = exprs[0]->calculate();
+        std::optional<sptrexpr_t> ares = exprs[1]->calculate();
+        std::optional<sptrexpr_t> bres = exprs[2]->calculate();
+        if (!res.has_value() || !ares.has_value() || !bres.has_value()) {
+            return {};
+        }
+        if ((res.value()->type != etype_t::objexpr_t) || (ares.value()->type != etype_t::objexpr_t) || (bres.value()->type != etype_t::objexpr_t)) { /* TODO: for now we require all to be obj sets here, but allow setgens in the future? */
+            return {}; /* TODO: should this error? */
+        }
+        sptrobjexpr_t ores = from_expr<objexpr_t>(res.value());
+        sptrobjexpr_t oares = from_expr<objexpr_t>(ares.value());
+        sptrobjexpr_t obres = from_expr<objexpr_t>(bres.value());
+        if ((ores->obj.type != otype_t::map_t) || (oares->obj.type != otype_t::set_t) || (obres->obj.type != otype_t::set_t)) {
+            return {}; /* TODO: should this error? */
+        }
+        if (!funcdefs.contains(ores->obj.name.value())) { /* TODO: what about anonymous maps? */
+            return {}; /* TODO: should this error? */
+        }
+        wptrmapdefexpr_t mapdef = funcdefs[ores->obj.name.value()];
+        std::optional<sptrexpr_t> amdset = mapdef.lock()->exprs[0]->calculate();
+        std::optional<sptrexpr_t> bmdset = mapdef.lock()->exprs[1]->calculate();
+        if (!amdset.has_value() || !bmdset.has_value()) {
+            return {};
+        }
+        if ((amdset.value()->type != etype_t::objexpr_t) || (bmdset.value()->type != etype_t::objexpr_t)) {
+        }
+        sptrobjexpr_t oamdset = from_expr<objexpr_t>(amdset.value());
+        sptrobjexpr_t obmdset = from_expr<objexpr_t>(bmdset.value());
+        if ((oamdset->obj.type != otype_t::set_t) || (obmdset->obj.type != otype_t::set_t)) {
+            return {}; /* TODO: should this error? */
+        }
+        sptrsubsetexpr_t asubset = make_subsetexpr();
+        asubset->add(oares);
+        asubset->add(oamdset);
+        std::optional<sptrexpr_t> asubsetres = asubset->calculate();
+        if (!asubsetres.has_value()) {
+            return {};
+        }
+        sptrobjexpr_t aissub = from_expr<objexpr_t>(asubsetres.value());
+        if (!std::get<bool>(aissub->obj.v)) {
+            return make_bool(false);
+        }
+        sptrsubsetexpr_t bsubset = make_subsetexpr();
+        bsubset->add(obmdset);
+        bsubset->add(obres);
+        std::optional<sptrexpr_t> bsubsetres = bsubset->calculate();
+        if (!bsubsetres.has_value()) {
+            return {};
+        }
+        sptrobjexpr_t bissub = from_expr<objexpr_t>(bsubsetres.value());
+        if (!std::get<bool>(bissub->obj.v)) {
+            return make_bool(false);
+        }
+        return make_bool(true);
+    }
+};
+
+sptrexpr_t mapspecexpr_t::copy() const {
+    return base_copy<mapspecexpr_t>();
+}
+
+DEF_PTRS(mapspecexpr);
+DEF_PTRFUN(mapspecexpr);
+
+
+struct setspecexpr_t : virtual expr_t {
+    setspecexpr_t() {
+        type = etype_t::setspecexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return true;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        os << L'{';
+        exprs[0]->disp_check_paren(os, self);
+        os << L" | ";
+        exprs[1]->disp_check_paren(os, self);
+        os << L'}';
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        return {};
+    }
+};
+
+
+sptrexpr_t setspecexpr_t::copy() const {
+    return base_copy<setspecexpr_t>();
+}
+
+DEF_PTRS(setspecexpr);
+DEF_PTRFUN(setspecexpr);
+
+
+struct stexpr_t : virtual expr_t {
+    stexpr_t() {
+        type = etype_t::stexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return true;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        os << L'{';
+        exprs[0]->disp_check_paren(os, self);
+        os << L" \\st ";
+        exprs[1]->disp_check_paren(os, self);
+        os << L'}';
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        return {};
+    }
+};
+
+
+sptrexpr_t stexpr_t::copy() const {
+    return base_copy<stexpr_t>();
+}
+
+DEF_PTRS(stexpr);
+DEF_PTRFUN(stexpr);
+
+
+struct unionexpr_t : virtual expr_t {
+    unionexpr_t() {
+        type = etype_t::unionexpr_t;
+    }
+
+    sptrexpr_t copy() const override;
+
+    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
+        return true;
+    }
+
+    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
+        os << L'{';
+        exprs[0]->disp_check_paren(os, self);
+        os << L" \\st ";
+        exprs[1]->disp_check_paren(os, self);
+        os << L'}';
+    }
+
+    std::optional<sptrexpr_t> calculate() const override {
+        return {};
+    }
+};
+
+sptrexpr_t unionexpr_t::copy() const {
+    return base_copy<unionexpr_t>();
+}
 
 
 static constexpr std::size_t randgen_default_sample_size = 10;
@@ -1978,8 +2183,317 @@ double expr_t::dist(const expr_t &other, std::size_t sample_size = randgen_defau
 }
 
 
+enum struct ttype_t : std::uint16_t {
+    none,
+    symbol_indicator,
+    unresolvable_indicator,
+    and_indicator,
+    or_indicator,
+    not_indicator,
+    in_indicator,
+    subset_indicator,
+    union_indicator,
+    intersect_indicator,
+    subtract_indicator,
+    st_indicator,
+    map_indicator,
+
+    comma,
+    paren_open,
+    paren_close,
+    curly_open,
+    curly_close,
+    sqbrk_open,
+    sqbrk_close,
+    bar,
+    arrow,
+    colon,
+    eqsign,
+    exclamation,
+    gtsign,
+    ltsign,
+
+    plus,
+    minus,
+    star,
+    slash, /* forward slash */
+    caret,
+
+    other_indicator,
+    name,
+
+    mpz,
+    mpfr,
+};
+
+const std::unordered_map<std::wstring, ttype_t> ttype_ind_map = { /* NOLINT */
+    {L"\\symbol", ttype_t::symbol_indicator},
+    {L"\\unresolvable", ttype_t::unresolvable_indicator},
+    {L"\\and", ttype_t::and_indicator},
+    {L"\\or", ttype_t::or_indicator},
+    {L"\\not", ttype_t::not_indicator},
+    {L"\\in", ttype_t::in_indicator},
+    {L"\\subset", ttype_t::subset_indicator},
+    {L"\\union", ttype_t::union_indicator},
+    {L"\\inters", ttype_t::intersect_indicator},
+    {L"\\minus", ttype_t::subtract_indicator},
+    {L"\\st", ttype_t::st_indicator},
+    {L"\\map", ttype_t::map_indicator},
+
+    /* {L"", ttype_t::none}, */
+
+    /* {L"", ttype_t::other_indicator}, */
+
+    /* {L"", ttype_t::name} */
+};
+
+const std::unordered_map<wchar_t, ttype_t> ttype_char_map = { /* NOLINT */
+    {L',', ttype_t::comma},
+    {L'(', ttype_t::paren_open},
+    {L')', ttype_t::paren_close},
+    {L'{', ttype_t::curly_open},
+    {L'}', ttype_t::curly_close},
+    {L'[', ttype_t::sqbrk_open},
+    {L']', ttype_t::sqbrk_close},
+    {L'|', ttype_t::bar},
+    {L':', ttype_t::colon},
+    {L'=', ttype_t::eqsign},
+    {L'!', ttype_t::exclamation},
+    {L'>', ttype_t::gtsign},
+    {L'<', ttype_t::ltsign},
+
+    {L'+', ttype_t::plus},
+    {L'-', ttype_t::minus},
+    {L'*', ttype_t::star},
+    {L'/', ttype_t::slash},
+    {L'^', ttype_t::caret},
+};
+
+std::optional<std::wstring> get_key(const std::unordered_map<std::wstring, ttype_t> &m, const ttype_t &v) {
+    for (const auto &[a, b] : m) {
+        if (b == v) {
+            return std::make_optional(a);
+        }
+    }
+    return {};
+}
+
+template <typename T>
+std::optional<T> get_value_by_view(const std::unordered_map<std::wstring, T> &m, const std::wstring_view &v) {
+    for (const auto &[a, b] : m) {
+        if (a == v) {
+            return std::make_optional(b);
+        }
+    }
+    return {};
+}
+
+template <typename T>
+std::optional<T> get_key(const std::unordered_map<T, ttype_t> &m, const ttype_t &v) {
+    for (const auto &[a, b] : m) {
+        if (b == v) {
+            return std::make_optional(a);
+        }
+    }
+    return {};
+}
+
+struct parsed_tok_t {
+    ttype_t type = ttype_t::none;
+    std::wstring_view t;
+
+    bool empty() const {
+        return type == ttype_t::none;
+    }
+};
+
+
+struct parser_t {
+    /* everything else not in here has higher precedence! */
+    static std::unordered_map<ttype_t, std::uint16_t> pred;
+
+    /* returns true if ok, assumes pos is initially valid */
+    bool get_token(const std::wstring_view &s, std::wstring_view::const_iterator &pos, std::vector<parsed_tok_t> &tbuf) {
+        while (std::iswspace(*pos)) {
+            pos++;
+            if (pos == s.end()) {
+                return true;
+            }
+        }
+        if (*pos == L'\\') {
+            if (!tbuf.empty()) {
+                if (tbuf.back().type == ttype_t::other_indicator) {
+                    return false;
+                }
+            }
+            std::wstring_view::const_iterator old_pos = pos;
+            pos++;
+            if (pos == s.end()) {
+                tbuf.push_back(parsed_tok_t{ttype_t::other_indicator, std::wstring_view(pos - 1, pos - 1)});
+                return true;
+            }
+            if (!get_token(s, pos, tbuf)) {
+                return false;
+            }
+            tbuf.back().t = std::wstring_view(old_pos, tbuf.back().t.end()); /* include initial backslash */
+            if (std::optional<ttype_t> v = get_value_by_view(ttype_ind_map, tbuf.back().t); v.has_value()) {
+                tbuf.back().type = v.value();
+            } else {
+                tbuf.back().type = ttype_t::other_indicator;
+            }
+            return true;
+        } else if (std::iswdigit(*pos) || *pos == L'.' || *pos == L'-') {
+            std::wstring_view::const_iterator end = pos;
+            if (*end == L'-') {
+                end++;
+                if (end == s.end()) {
+                    tbuf.push_back(parsed_tok_t{ttype_t::minus, std::wstring_view(pos, pos + 1)});
+                    return true;
+                }
+            }
+            bool seen_dot = *pos == L'.';
+            bool seen_e = false;
+            bool seen_e_neg = false;
+            for (; end != s.end(); end++) {
+                if (std::iswdigit(*end)) {
+                    continue;
+                }
+                if (*end == L'-') {
+                    if (!seen_e) {
+                        break;
+                    }
+                    if (seen_e_neg) {
+                        break;
+                    } else {
+                        seen_e_neg = true;
+                        continue;
+                    }
+                }
+
+                if (*end == L'e') {
+                    if (seen_e) {
+                        break;
+                    }
+                    seen_e = true;
+                    continue;
+                }
+
+                if (*end == L'.') {
+                    if (seen_dot || seen_e) {
+                        break;
+                    }
+                    seen_dot = true;
+                    continue;
+                }
+
+                break;
+            }
+            if (end == pos + 1 && *pos == L'-') {
+                tbuf.push_back(parsed_tok_t{ttype_t::minus, std::wstring_view(pos, pos + 1)});
+            } else if (seen_dot || seen_e) {
+                tbuf.push_back(parsed_tok_t{ttype_t::mpfr, std::wstring_view(pos, end)});
+            } else {
+                tbuf.push_back(parsed_tok_t{ttype_t::mpz, std::wstring_view(pos, end)});
+            }
+            return true;
+        } else if (ttype_char_map.contains(*pos)) {
+            tbuf.push_back(parsed_tok_t{ttype_char_map.at(*pos), std::wstring_view(pos, pos + 1)});
+            pos++;
+            return true;
+        } else { /* is name */
+            std::wstring_view::const_iterator name = pos;
+            for (; name != s.end(); name++) {
+                if (std::iswspace(*name) || ttype_char_map.contains(*name)) {
+                    break;
+                }
+            }
+            tbuf.push_back(parsed_tok_t{ttype_t::name, std::wstring_view(pos, name)});
+            pos = name;
+            return true;
+        }
+    }
+
+    /* if an until_tok is hit, we also consume it and place in tbuf */
+    void parse_until_any_of(sptrexpr_t e, const std::wstring_view &s, const std::vector<ttype_t> &until_tok, std::optional<std::size_t> max_count = {}) { /* NOLINT */
+        if (s.empty()) {
+            return;
+        }
+        std::vector<parsed_tok_t> tbuf;
+        std::wstring_view::const_iterator pos = s.begin();
+        while (true) {
+            if (e->exprs.size() >= max_count) {
+                break;
+            }
+            if (!get_token(s, pos, tbuf)) {
+                ERR_EXIT(1, "could not get valid token in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
+            }
+            if (tbuf.empty()) {
+                return;
+            }
+            if (tbuf.back().type == ttype_t::other_indicator) {
+                ERR_EXIT(1, "could not get valid token, unfinished indicator in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str())
+            }
+            for (const ttype_t &ut : until_tok) {
+                if (ut == tbuf.back().type) {
+                    return;
+                }
+            }
+            switch (tbuf.back().type) {
+                case ttype_t::symbol_indicator: {
+                    if (!get_token(s, pos, tbuf)) {
+                        ERR_EXIT(1, "could not get valid token, expected symbol name after \"\\symbol\" in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
+                    }
+                    sptrobjexpr_t oe = make_objexpr();
+                    oe->obj.type = otype_t::symbol_t;
+                    oe->obj.name = tbuf.back().t;
+                    e->add(oe);
+                    tbuf.pop_back();
+                    tbuf.pop_back();
+                    break;
+                }
+                case ttype_t::unresolvable_indicator: {
+                    sptrobjexpr_t oe = make_objexpr();
+                    oe->obj.type = otype_t::unresolvable_t;
+                    e->add(oe);
+                    tbuf.pop_back();
+                    break;
+                }
+                case ttype_t::not_indicator: {
+                    sptrnotexpr_t ne = make_notexpr();
+                    parse_until_any_of(to_expr(ne), std::wstring_view(tbuf.back().t.end(), s.end()), {}, 1);
+                    e->add(ne);
+                    tbuf.pop_back();
+                    break;
+                }
+                case ttype_t::in_indicator: {
+                    sptrcontainedexpr_t ce = make_containedexpr();
+                    AAAAA;
+                }
+
+                /* infix section */
+                case ttype_t::and_indicator: {
+
+                }
+            }
+        }
+    }
+};
+
+
+
 int main() {
     gmp_randinit_default(randstate);
+    std::setlocale(LC_ALL, "");
+
+    parser_t::pred = {
+        {ttype_t::plus, 10},
+        {ttype_t::minus, 10},
+        {ttype_t::star, 10},
+        {ttype_t::slash, 10},
+        {ttype_t::caret, 10},
+        {ttype_t::bar, 50},
+        {ttype_t::comma, 100},
+    };
 
     // void *dlhandle = dlopen(WORK_SO_FILENAME, RTLD_LAZY);
     // expr_work = reinterpret_cast<decltype(expr_work)>(dlsym(dlhandle, "expr_work")); /* NOLINT */
@@ -1992,19 +2506,19 @@ int main() {
     sptrmapdefexpr_t fndef = make_mapdefexpr();
     sptrobjexpr_t domainset = make_objexpr();
     domainset->obj.type = otype_t::set_t;
-    expr_add_expr(fndef, domainset->copy());
-    expr_add_expr(fndef, domainset);
+    fndef->add(domainset->copy());
+    fndef->add(domainset);
     sptraddexpr_t fnbody = make_addexpr();
     sptrnegexpr_t neg = make_negexpr();
     sptrobjexpr_t var = make_objexpr();
     var->obj.name = L"x";
-    expr_add_expr(neg, var);
-    expr_add_expr(fnbody, neg);
+    neg->add(var);
+    fnbody->add(neg);
     mpzw_t i{};
     mpz_init_set_ui(i.z, 1);
     sptrobjexpr_t one = make_mpzw(i);
-    expr_add_expr(fnbody, one);
-    expr_add_expr(fndef, fnbody);
+    fnbody->add(one);
+    fndef->add(fnbody);
     fndef->func_name = L"f";
     fndef->param_names.emplace_back(L"x");
     expr_add_to_defs(fndef);
@@ -2014,8 +2528,8 @@ int main() {
     sptrobjexpr_t fnref = make_objexpr();
     fnref->obj.name = L"f";
     fnref->obj.type = otype_t::map_t;
-    expr_add_expr(fncall, fnref);
-    expr_add_expr(fncall, one->copy());
+    fncall->add(fnref);
+    fncall->add(one->copy());
 
     sptrobjexpr_t ores = from_expr<objexpr_t>(fncall->calculate().value_or(make_objexpr()));
     std::wcout << "defined ";
