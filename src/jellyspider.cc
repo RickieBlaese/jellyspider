@@ -266,7 +266,7 @@ enum struct otype_t : std::uint16_t {
     set_t, /* {...} */
     tuple_t, /* (...) */
 
-    symbol_t, /* \symbol name */
+    symbol_t, /* \sym name */
 
     unresolvable_t /* \unresolvable */
 };
@@ -364,6 +364,16 @@ enum struct etype_t : std::uint16_t {
     orexpr_t, /* a \or b \or ... (-> bool) */
     notexpr_t, /* \not a (-> bool) */
 
+    /* the first subexpression a can be either
+     * 1. a tuple like (x, y, ...),
+     *    in which case each element must be a name, which must be undefined prior and must be either defined or referenced in b
+     * 2. a name like x,
+     *    in which case it must be undefined prior and must be either defined or referenced in b
+     * existsexpr_t checks if there are such x, y, ... that satisfy b.
+     * 
+     * */
+    existsexpr_t, /* \exists a b (-> bool) */
+
     containedexpr_t, /* a \in b (-> bool) */
     subsetexpr_t, /* a \subset b \subset ... (-> bool) */
 
@@ -377,7 +387,7 @@ enum struct etype_t : std::uint16_t {
 
     /* a should be an expression which uses referenced objects which are either defined in b or referenced in b
      * b must evaluate to a bool
-     * this can produce any a which satisfy b
+     * this can produce any a which satisfies b. if there is no such a which satisfies b, this expression will most likely hang.
      */
     stexpr_t, /* a \st b */
 
@@ -399,14 +409,15 @@ enum struct etype_t : std::uint16_t {
      * f is a referenced obj map */
     mapdefexpr_t, /* \map f: a -> b := x -> c */
 
-    /* we store a weak ptr to the mapdefexpr_t for the function f. recall all names are global.
+    /* we store a weak (why not strong though?) ptr to the mapdefexpr_t for the function f. recall all names are global.
      * at creation time, try to find the mapdefexpr_t for the function f
      * additionally, this only consumes one more expr. this expr can either be PARSED as
      * 1. a tuple,
      *    in which case each element of the tuple gets passed to f as expected
      * 2. anything else,
      *    in which case the expr gets passed as the first element to f
-     * note that mapcalls have the highest precedence in parsing */
+     * note: mapcalls have the highest precedence level in parsing, i.e. parsed as soon as they're detected,
+     *       unless they are already "bound" to another expression previously, like as the first */
     mapcallexpr_t, /* f X */
 
 };
@@ -910,12 +921,12 @@ struct objexpr_t : virtual expr_t {
                 os << L')';
                 return;
             case otype_t::symbol_t:
-                os << L'\\';
+                os << L"\\sym";
                 os << obj.name.value();
                 os << L' ';
                 return;
             case otype_t::unresolvable_t:
-                os << L"_unresolvable";
+                os << L"\\unresolvable";
                 return;
             case otype_t::none:
                 if (is_ref_obj()) {
@@ -925,9 +936,9 @@ struct objexpr_t : virtual expr_t {
                 }
                 return;
             default:
-                os << L"_objexprtype" << static_cast<std::uint16_t>(obj.type) << '{';
+                os << L"_objexprtype" << static_cast<std::uint16_t>(obj.type) << L'{';
                 disp_exprs_sep(os, L", ", exprs.begin(), exprs.end());
-                os << '}';
+                os << L'}';
                 return;
         }
     }
@@ -1841,7 +1852,7 @@ struct tuplegetexpr_t : virtual expr_t {
             ERR_EXIT(1, "tuplegetexpr_t: expected index %s to be less than the tuple size %zu", wstr_to_str(oindres->disp_to_str()).c_str(), ores->exprs.size());
         }
         if (mpz_cmp_ui(ind.z, 0) < 0) {
-            ERR_EXIT(1, "tuplegetexpr_t: expected index %s to be greater than 0", wstr_to_str(oindres->disp_to_str()).c_str());
+            ERR_EXIT(1, "tuplegetexpr_t: expected index %s to be greater than or equal to 0", wstr_to_str(oindres->disp_to_str()).c_str());
         }
         return ores->exprs[mpz_get_ui(ind.z)];
     }
@@ -2227,7 +2238,7 @@ enum struct ttype_t : std::uint16_t {
 };
 
 const std::unordered_map<std::wstring, ttype_t> ttype_ind_map = { /* NOLINT */
-    {L"\\symbol", ttype_t::symbol_indicator},
+    {L"\\sym", ttype_t::symbol_indicator},
     {L"\\unresolvable", ttype_t::unresolvable_indicator},
     {L"\\and", ttype_t::and_indicator},
     {L"\\or", ttype_t::or_indicator},
@@ -2309,15 +2320,19 @@ struct parsed_tok_t {
 
 
 struct parser_t {
+    std::unordered_map<std::wstring, sptrexpr_t> defobjs;
+
     /* everything else not in here has higher precedence! */
     static std::unordered_map<ttype_t, std::uint16_t> pred;
 
     /* returns true if ok, assumes pos is initially valid */
-    bool get_token(const std::wstring_view &s, std::wstring_view::const_iterator &pos, std::vector<parsed_tok_t> &tbuf) {
-        while (std::iswspace(*pos)) {
-            pos++;
-            if (pos == s.end()) {
-                return true;
+    bool get_token(const std::wstring_view &s, std::wstring_view::const_iterator &pos, std::vector<parsed_tok_t> &tbuf, bool consume_whitespace = true) {
+        if (consume_whitespace) {
+            while (std::iswspace(*pos)) {
+                pos++;
+                if (pos == s.end()) {
+                    return true;
+                }
             }
         }
         if (*pos == L'\\') {
@@ -2332,7 +2347,7 @@ struct parser_t {
                 tbuf.push_back(parsed_tok_t{ttype_t::other_indicator, std::wstring_view(pos - 1, pos - 1)});
                 return true;
             }
-            if (!get_token(s, pos, tbuf)) {
+            if (!get_token(s, pos, tbuf, false)) {
                 return false;
             }
             tbuf.back().t = std::wstring_view(old_pos, tbuf.back().t.end()); /* include initial backslash */
@@ -2420,10 +2435,18 @@ struct parser_t {
         }
         std::vector<parsed_tok_t> tbuf;
         std::wstring_view::const_iterator pos = s.begin();
+
+#define CHECK_COUNT \
+    if (max_count.has_value()) { \
+        if (e->exprs.size() >= max_count.value()) { \
+            break; \
+        } \
+    }
+
+        bool continued = false;
+        std::optional<ttype_t> last_binary_type;
         while (true) {
-            if (e->exprs.size() >= max_count) {
-                break;
-            }
+            /* TODO: however, we always have to parse more than count because they could be a mapcall */
             if (!get_token(s, pos, tbuf)) {
                 ERR_EXIT(1, "could not get valid token in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
             }
@@ -2438,10 +2461,14 @@ struct parser_t {
                     return;
                 }
             }
+            bool is_infix = false;
             switch (tbuf.back().type) {
                 case ttype_t::symbol_indicator: {
                     if (!get_token(s, pos, tbuf)) {
-                        ERR_EXIT(1, "could not get valid token, expected symbol name after \"\\symbol\" in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
+                        ERR_EXIT(1, "could not get valid token, expected symbol name after \"\\sym\" in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
+                    }
+                    if (tbuf.back().t.empty()) {
+                        ERR_EXIT(1, "could not get valid token, expected symbol name after \"\\sym\" in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
                     }
                     sptrobjexpr_t oe = make_objexpr();
                     oe->obj.type = otype_t::symbol_t;
@@ -2460,20 +2487,41 @@ struct parser_t {
                 }
                 case ttype_t::not_indicator: {
                     sptrnotexpr_t ne = make_notexpr();
-                    parse_until_any_of(to_expr(ne), std::wstring_view(tbuf.back().t.end(), s.end()), {}, 1);
+                    parse_until_any_of(to_expr(ne), std::wstring_view(tbuf.back().t.end(), s.end()), until_tok, 1);
                     e->add(ne);
                     tbuf.pop_back();
                     break;
                 }
                 case ttype_t::in_indicator: {
+                    if (e->exprs.empty()) { /* needs previous expression */
+                        ERR_EXIT(1, "could not parse an \"\\in\" expression, expected previous expression near %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
+                    }
+                    is_infix = true;
                     sptrcontainedexpr_t ce = make_containedexpr();
-                    AAAAA;
+                    sptrexpr_t a = e->exprs.back();
+                    e->exprs.pop_back(); /* steal one off */
+                    parse_until_any_of(e, std::wstring_view(tbuf.back().t.end(), s.end()), until_tok, 1); /* get one more */
+                    continued = true;
+                    continue; /* TODO: is this correct? we need to store the last parsed binexpr type, no? */
                 }
 
                 /* infix section */
                 case ttype_t::and_indicator: {
-
+                    is_infix = true;
                 }
+            }
+            if (!is_infix) {
+                /* specifying the sets for each map is optional, since they are not required for simply calling maps */
+                /* Fn: {(A, B) | A \in Set \and B \in Set} -> Map := (A, B) -> {f | f: A -> B}
+                 * f: Fn(R, R) -> Fn(R, R) := g -> (x -> g(x + 1))
+                 * h: R -> R := x -> 2 * x
+                 * f h 3 or (f h) 3 will expand to 2 * (3+1)
+                 */
+                /* abs: R -> R := x -> (x, -x)[Int(x < 0)]
+                 *                                            parsing artifact for implies \/                        parsing artifact for implies \/
+                 * lim: {f | f: N -> R} -> R := f -> L \st (epsilon \in R \and epsilon > 0 => \exists bign (bign \in N \and n \in N \and n > bign => abs(f n - L) < epsilon))
+                 *
+                 */
             }
         }
     }
