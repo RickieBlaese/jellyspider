@@ -624,6 +624,11 @@ struct expr_t { /* NOLINT */
         std::erase(exprs, expr);
     }
 
+    void replace(const sptrexpr_t &oldexpr, const sptrexpr_t &newexpr) {
+        del(oldexpr);
+        add(newexpr);
+    }
+
 
     bool is_calc_form() const {
         if (type != etype_t::objexpr_t) { return false; }
@@ -2318,12 +2323,32 @@ struct parsed_tok_t {
     }
 };
 
+/* ******************** NOTE: ON ZFC ******************** */
+/* we do not ENFORCE the axioms of ZFC. we provide arbitrary
+ * set builder notation in setspecexpr_t, and thus it is
+ * possible for input to specify for example a set of all
+ * sets using the following \tset. this is not something
+ * jellyspider will attempt to detect at runtime, since it
+ * is far too expensive. while jellyspider will accept it
+ * in parsing, it will not ever generate the tester
+ * reserved names (the ones that start with \t) during
+ * dist_randgen or similar.
+ *
+ */
+
+static std::vector<std::wstring> reserved_names = { /* NOLINT */
+    L"\\cint", /* map from bool to int, returns 0 if false and 1 if true */
+    L"\\tset", /* map to bool, returns true if input is a set, false otherwise */
+    L"\\ttuple", /* map to bool, returns true if input is a tuple, false otherwise */
+    L"\\tsymbol", /* map to bool, returns true if input is a symbol, false otherwise */
+};
 
 struct parser_t {
     std::unordered_map<std::wstring, sptrexpr_t> defobjs;
 
     /* everything else not in here has higher precedence! */
     static std::unordered_map<ttype_t, std::uint16_t> pred;
+
 
     /* returns true if ok, assumes pos is initially valid */
     bool get_token(const std::wstring_view &s, std::wstring_view::const_iterator &pos, std::vector<parsed_tok_t> &tbuf, bool consume_whitespace = true) {
@@ -2435,6 +2460,7 @@ struct parser_t {
         }
         std::vector<parsed_tok_t> tbuf;
         std::wstring_view::const_iterator pos = s.begin();
+        
 
 #define CHECK_COUNT \
     if (max_count.has_value()) { \
@@ -2443,9 +2469,33 @@ struct parser_t {
         } \
     }
 
-        bool continued = false;
         std::optional<ttype_t> last_binary_type;
-        while (true) {
+        std::uint64_t count = 0;
+        auto compress_mapcall = [&]() {
+            if (count > 0) {
+                sptrexpr_t f = e->exprs.back();
+                e->del(f);
+                sptrexpr_t a = e->exprs.back();
+                e->del(a);
+                sptrmapcallexpr_t mc = make_mapcallexpr();
+                mc->add(f);
+                bool added = false;
+                if (a->type == etype_t::objexpr_t) {
+                    sptrobjexpr_t ta = from_expr<objexpr_t>(a);
+                    if (ta->obj.type == otype_t::tuple_t) {
+                        for (sptrexpr_t &te : ta->exprs) {
+                            mc->add(te);
+                        }
+                        added = true;
+                    }
+                }
+                if (!added) {
+                    mc->add(a);
+                }
+            }
+        };
+        for (;; count++) {
+            compress_mapcall(); /* TODO */
             /* TODO: however, we always have to parse more than count because they could be a mapcall */
             if (!get_token(s, pos, tbuf)) {
                 ERR_EXIT(1, "could not get valid token in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
@@ -2501,7 +2551,6 @@ struct parser_t {
                     sptrexpr_t a = e->exprs.back();
                     e->exprs.pop_back(); /* steal one off */
                     parse_until_any_of(e, std::wstring_view(tbuf.back().t.end(), s.end()), until_tok, 1); /* get one more */
-                    continued = true;
                     continue; /* TODO: is this correct? we need to store the last parsed binexpr type, no? */
                 }
 
@@ -2512,7 +2561,7 @@ struct parser_t {
             }
             if (!is_infix) {
                 /* specifying the sets for each map is optional, since they are not required for simply calling maps */
-                /* Fn: {(A, B) | A \in Set \and B \in Set} -> Map := (A, B) -> {f | f: A -> B}
+                /* Fn: {(A, B) | \tset A \and \tset B} -> Map := (A, B) -> {f | f: A -> B}
                  * f: Fn(R, R) -> Fn(R, R) := g -> (x -> g(x + 1))
                  * h: R -> R := x -> 2 * x
                  * f h 3 or (f h) 3 will expand to 2 * (3+1)
@@ -2522,7 +2571,21 @@ struct parser_t {
                  * lim: {f | f: N -> R} -> R := f -> L \st (epsilon \in R \and epsilon > 0 => \exists bign (bign \in N \and n \in N \and n > bign => abs(f n - L) < epsilon))
                  *
                  */
+                /* another example
+                   theorems:
+                 * a + b = b + a
+                 * 0 + a = 0
+                 * a - b = -b + a
+                 * a * (b + c) = a*b + a*c
+                 * a / b = a * (1 / b) \req b != 0
+                 * a / a = 1 \req a != 0
+
+                   expression:
+                 * j := x -> x+1
+                 * (j 1 + 1 - j 1) / j 1
+                 */
             }
+            return;
         }
     }
 };
