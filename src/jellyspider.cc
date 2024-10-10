@@ -1,4 +1,5 @@
 #include <functional>
+#include <iomanip>
 #include <memory>
 #include <optional>
 #include <random>
@@ -73,6 +74,46 @@
 }
 
 #endif
+
+template <typename CharT>
+std::basic_string<CharT> quote_str(const std::basic_string<CharT> &s, bool always = false) {
+    /* if (handle_newlines) {
+        bool prev_backslash = false;
+        for (std::size_t i = 0; i < n.size(); i++) {
+            const char &c = n[i];
+            if (c == '\n') {
+                n[i] = 'n';
+                n.insert(n.begin() + static_cast<std::basic_string<CharT>::iterator::difference_type>(i), '\\');
+                if (prev_backslash) {
+                    n.insert(n.begin() + static_cast<std::basic_string<CharT>::iterator::difference_type>(i), '\\'); // another one - WRONG
+                }
+                prev_backslash = false;
+                continue;
+            }
+            if (!prev_backslash) {
+                if (c == '\\') {
+                    prev_backslash = true;
+                    continue;
+                }
+            }
+            prev_backslash = false;
+        }
+    } */
+    std::basic_stringstream<CharT> ss;
+    ss << std::quoted(s);
+    std::basic_string<CharT> r = ss.str();
+    if (!always && r.substr(1, r.size() - 2) == s) {
+        return s;
+    }
+    return r;
+}
+
+/* NOLINTBEGIN */
+#define cquote_str(A) (quote_str(A).c_str())
+#define cquote_stra(A) (quote_str(A, true).c_str())
+#define quote_stra(A) (quote_str(A, true))
+/* NOLINTEND */
+
 
 template <typename T>
 void vec_uniqueify(std::vector<T> &v, const std::function<bool (const T &, const T &)> &eq) {
@@ -272,16 +313,16 @@ enum struct otype_t : std::uint16_t {
 };
 
 /* name has value when it's an unspecified object - i.e. with .v as monostate 
- * note that however, .v being monostate does not imply unspecified - it could be a set objexpr_t with other child exprs, mapcall, or tuple
+ * note that however, .v being monostate does not imply unspecified - it could be a set objexpr_t with other child exprs, map, or tuple
  * we don't define any constructors / assignment operators here other than the copy assignment operator because objexpr_t
  * handles the rest - in other words, only use obj_t in conjunction with an objexpr_t!! */
 struct obj_t { /* NOLINT */
-    std::optional<std::wstring> name;
     otype_t type = otype_t::none;
     std::variant<std::monostate, bool, mpzw_t, dec_t> v; /* bool_v, int_v, and dec_v */
+    std::vector<std::wstring> map_param_names;
 
     bool operator==(const obj_t &other) const {
-        bool res = type == other.type && name.has_value() == other.name.has_value() && v.index() == other.v.index();
+        bool res = type == other.type && v.index() == other.v.index();
         if (v.index() > 0 && v.index() == other.v.index()) {
             std::visit([&res, &other](const auto &val) {
                 if constexpr (std::is_same_v<decltype(val), bool>) {
@@ -293,15 +334,12 @@ struct obj_t { /* NOLINT */
                 }
             }, v);
         }
-        if (name.has_value() && other.name.has_value()) {
-            res = res && name.value() == other.name.value();
-        }
         return res;
     }
 
     obj_t &operator=(const obj_t &other) { /* assumes v is std::monostate */
-        name = other.name;
         type = other.type;
+        map_param_names = other.map_param_names;
         std::visit([this](const auto &val) {
             if constexpr (std::is_same_v<decltype(val), mpzw_t>) {
                 v = mpzw_t{};
@@ -577,10 +615,12 @@ struct expr_t { /* NOLINT */
     wptrexpr_t self;
     std::vector<sptrexpr_t> exprs;
     std::vector<wptrexpr_t> parents;
+    std::optional<std::wstring> name;
     /* pair is object, most immediate parent expr */
     std::vector<std::pair<wptrobjexpr_t, wptrexpr_t>> all_objs;
     etype_t type = etype_t::none;
-    sptrexpr_t work_cache, calc_cache; /* calc_cache doesn't hold a value when calculate failed */
+    sptrexpr_t work_cache;
+    sptrobjexpr_t calc_cache; /* calc_cache doesn't hold a value when calculate failed */
     bool work_dirty = true, calc_dirty = true;
 
     explicit expr_t() = default;
@@ -613,15 +653,22 @@ struct expr_t { /* NOLINT */
         exprs.emplace_back(to_expr(expr));
     }
 
-    /* does not check any expired parents in expr->parents */
+    /* does not check any expired parents in expr->parents
+     * removes last element that equals expr, and last parent that matches self */
     void del(const sptrexpr_t &expr) {
-        std::erase_if(expr->parents, [&](const wptrexpr_t &e) {
+        auto it = std::find_if(expr->parents.rbegin(), expr->parents.rend(), [&](const wptrexpr_t &e) {
             if (!e.expired()) {
                 return e.lock() == self.lock();
             }
             return false;
         });
-        std::erase(exprs, expr);
+        if (it != expr->parents.rend()) {
+            expr->parents.erase(it.base());
+        }
+        auto eit = std::find(exprs.rbegin(), exprs.rend(), expr);
+        if (eit != exprs.rend()) {
+            exprs.erase(eit.base());
+        }
     }
 
     void replace(const sptrexpr_t &oldexpr, const sptrexpr_t &newexpr) {
@@ -660,39 +707,7 @@ struct expr_t { /* NOLINT */
      * does not copy parent
      */
     template <typename T>
-    sptrexpr_t base_copy() const {
-        sptrexpr_t e = to_expr(std::make_shared<T>());
-        e->self = e;
-        e->type = type;
-        e->exprs.resize(exprs.size());
-        for (std::size_t i = 0; i < exprs.size(); i++) {
-            e->exprs[i] = exprs[i]->copy();
-            e->exprs[i]->parents.push_back(e);
-        }
-        for (const sptrexpr_t &expr : e->exprs) {
-            if (expr->type == etype_t::objexpr_t) {
-                e->all_objs.emplace_back(from_expr<objexpr_t>(expr), e->self);
-            }
-            e->all_objs.insert(e->all_objs.end(), expr->all_objs.begin(), expr->all_objs.end());
-        }
-        std::function<bool (const std::pair<wptrobjexpr_t, wptrexpr_t> &, const std::pair<wptrobjexpr_t, wptrexpr_t> &)> peq = [](const std::pair<wptrobjexpr_t, wptrexpr_t> &a, const std::pair<wptrobjexpr_t, wptrexpr_t> &b) {
-            if (a.first.expired() || a.second.expired() || b.first.expired() || b.second.expired()) {
-                return false;
-            } else {
-                return a.first.lock() == b.first.lock() && a.second.lock() == b.second.lock();
-            }
-        };
-        vec_uniqueify(e->all_objs, peq);
-        e->work_dirty = work_dirty;
-        e->calc_dirty = calc_dirty;
-        if (!work_dirty) {
-            e->work_cache = work_cache->copy();
-        }
-        if (!calc_dirty) {
-            e->calc_cache = calc_cache->copy();
-        }
-        return e;
-    }
+    sptrexpr_t base_copy() const;
 
     virtual sptrexpr_t copy() const {
         return base_copy<expr_t>();
@@ -760,31 +775,13 @@ struct expr_t { /* NOLINT */
     }
 
     /* if you want a redone work-ed expr that isn't from work_cache, just call expr_work */
-    sptrexpr_t load(bool can_calculate) {
-        if (can_calculate) {
-            if (calc_dirty) {
-                std::optional<sptrexpr_t> o = calculate();
-                if (o.has_value()) {
-                    calc_cache = std::move(o.value());
-                }
-                calc_dirty = false;
-            }
-            if (calc_cache) {
-                return calc_cache->copy();
-            }
-        }
-        if (work_dirty) {
-            work_cache = expr_work(*this, {}, thms);
-            work_dirty = false;
-        }
-        return work_cache->copy();
-    }
+    sptrexpr_t load(bool can_calculate);
 
     /* if optional has no value, it could not be calculated
      * otherwise should return an objexpr_t, with ALL (recursive) child exprs also objexpr_t - this is the only valid calcuated form (note we don't say "closed form" - it is more subjective and hazy, it depends on the context)
      * it is up to each derived expr_t class to determine precision requirements (DEAL WITH IT!!!)
      */
-    virtual std::optional<sptrexpr_t> calculate() const {
+    virtual std::optional<sptrobjexpr_t> calculate() const {
         return {};
     }
 
@@ -845,8 +842,8 @@ struct objexpr_t : virtual expr_t {
     }
 
 
-    std::optional<sptrexpr_t> calculate() const override {
-        return copy();
+    std::optional<sptrobjexpr_t> calculate() const override {
+        return from_expr<objexpr_t>(copy());
     }
 
     /* dist are between 0 and 1 */
@@ -889,7 +886,7 @@ struct objexpr_t : virtual expr_t {
     }
 
     bool is_ref_obj() const {
-        return obj.name.has_value() && exprs.empty() && obj.v.index() == 0;
+        return name.has_value() && exprs.empty() && obj.v.index() == 0;
     }
 
     bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
@@ -913,7 +910,37 @@ struct objexpr_t : virtual expr_t {
                 os << str_to_wstr(std::get<dec_t>(obj.v).toString());
                 return;
             case otype_t::map_t:
-                os << obj.name.value();
+                if (name.has_value()) {
+                    os << name.value();
+                    bool has_either = exprs[0]->type != etype_t::none || exprs[1]->type != etype_t::none;
+                    if (has_either) {
+                        os << L": ";
+                        if (exprs[0]->type != etype_t::none) {
+                            exprs[0]->disp_check_paren(os, self);
+                        }
+                        if (exprs[1]->type != etype_t::none) {
+                            if (exprs[0]->type != etype_t::none) {
+                                os << L' ';
+                            }
+                            os << L"-> ";
+                            exprs[1]->disp_check_paren(os, self);
+                        }
+                    }
+                    os << L" := ";
+                }
+                if (obj.map_param_names.size() > 1) {
+                    os << L'(';
+                    os << obj.map_param_names[0];
+                    for (std::size_t i = 1; i < obj.map_param_names.size(); i++) {
+                        os << L", ";
+                        os << obj.map_param_names[i];
+                    }
+                    os << L')';
+                } else {
+                    os << obj.map_param_names[0];
+                }
+                os << L" -> ";
+                exprs[2]->disp_check_paren(os, self);
                 return;
             case otype_t::set_t:
                 os << L'{';
@@ -927,7 +954,7 @@ struct objexpr_t : virtual expr_t {
                 return;
             case otype_t::symbol_t:
                 os << L"\\sym";
-                os << obj.name.value();
+                os << name.value();
                 os << L' ';
                 return;
             case otype_t::unresolvable_t:
@@ -935,7 +962,7 @@ struct objexpr_t : virtual expr_t {
                 return;
             case otype_t::none:
                 if (is_ref_obj()) {
-                    os << obj.name.value();
+                    os << name.value();
                 } else {
                     os << L"_noneobj";
                 }
@@ -951,6 +978,61 @@ struct objexpr_t : virtual expr_t {
 
 DEF_PTRFUN(objexpr);
 
+template <typename T>
+sptrexpr_t expr_t::base_copy() const {
+    sptrexpr_t e = to_expr(std::make_shared<T>());
+    e->self = e;
+    e->type = type;
+    e->name = name;
+    e->exprs.resize(exprs.size());
+    for (std::size_t i = 0; i < exprs.size(); i++) {
+        e->exprs[i] = exprs[i]->copy();
+        e->exprs[i]->parents.push_back(e);
+    }
+    for (const sptrexpr_t &expr : e->exprs) {
+        if (expr->type == etype_t::objexpr_t) {
+            e->all_objs.emplace_back(from_expr<objexpr_t>(expr), e->self);
+        }
+        e->all_objs.insert(e->all_objs.end(), expr->all_objs.begin(), expr->all_objs.end());
+    }
+    std::function<bool (const std::pair<wptrobjexpr_t, wptrexpr_t> &, const std::pair<wptrobjexpr_t, wptrexpr_t> &)> peq = [](const std::pair<wptrobjexpr_t, wptrexpr_t> &a, const std::pair<wptrobjexpr_t, wptrexpr_t> &b) {
+        if (a.first.expired() || a.second.expired() || b.first.expired() || b.second.expired()) {
+            return false;
+        } else {
+            return a.first.lock() == b.first.lock() && a.second.lock() == b.second.lock();
+        }
+    };
+    vec_uniqueify(e->all_objs, peq);
+    e->work_dirty = work_dirty;
+    e->calc_dirty = calc_dirty;
+    if (!work_dirty) {
+        e->work_cache = work_cache->copy();
+    }
+    if (!calc_dirty) {
+        e->calc_cache = from_expr<objexpr_t>(calc_cache->copy());
+    }
+    return e;
+}
+
+sptrexpr_t expr_t::load(bool can_calculate) {
+    if (can_calculate) {
+        if (calc_dirty) {
+            std::optional<sptrobjexpr_t> o = calculate();
+            if (o.has_value()) {
+                calc_cache = std::move(o.value());
+            }
+            calc_dirty = false;
+        }
+        if (calc_cache) {
+            return calc_cache->copy();
+        }
+    }
+    if (work_dirty) {
+        work_cache = expr_work(*this, {}, thms);
+        work_dirty = false;
+    }
+    return work_cache->copy();
+}
 
 /* does not touch .parents or .exprs */
 void expr_t::add_obj(const wptrobjexpr_t &o, const sptrexpr_t &parent) {
@@ -978,6 +1060,10 @@ sptrexpr_t objexpr_t::copy() const {
         mpz_init_set(nz.z, std::get<mpzw_t>(obj.v).z);
     }
     return to_expr(oe);
+}
+
+sptrexpr_t make_none() {
+    return std::make_shared<expr_t>();
 }
 
 sptrobjexpr_t make_bool(bool v) {
@@ -1041,59 +1127,21 @@ sptrexpr_t objexpr_t::generate() const {
     }
 }
 
-struct mapdefexpr_t;
 
-DEF_PTRS(mapdefexpr);
+/* ******************** NOTE: ON ZFC ******************** */
+/* we do not ENFORCE the axioms of ZFC. we provide arbitrary
+ * set builder notation in setspecexpr_t, and thus it is
+ * possible for input to specify for example a set of all
+ * sets using the following \tset. this is not something
+ * jellyspider will attempt to detect at runtime, since it
+ * is far too expensive. while jellyspider will accept it
+ * in parsing, it will not ever generate the tester
+ * reserved names (the ones that start with \t) during
+ * dist_randgen or similar.
+ *
+ */
 
-std::unordered_map<std::wstring, wptrmapdefexpr_t> funcdefs; /* NOLINT */
-
-struct mapdefexpr_t : virtual expr_t {
-    std::wstring func_name;
-    std::vector<std::wstring> param_names;
-
-    sptrexpr_t func_body() {
-        return exprs[2];
-    }
-
-    mapdefexpr_t() {
-        type = etype_t::mapdefexpr_t;
-    }
-
-    bool disp_needs_paren(const std::optional<wptrexpr_t> &parent) const override {
-        return true;
-    }
-
-    void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
-        os << L"\\map ";
-        os << func_name;
-        os << L": ";
-        exprs[0]->disp(os, self);
-        os << L" -> ";
-        exprs[1]->disp(os, self);
-        os << L" := ";
-        if (param_names.size() > 1) {
-            os << L'(';
-        }
-        for (std::size_t i = 0; i < param_names.size() - 1; i++) {
-            os << param_names[i] << L", ";
-        }
-        if (!param_names.empty()) {
-            os << param_names[param_names.size() - 1];
-        }
-        if (param_names.size() > 1) {
-            os << L')';
-        }
-        os << L" -> ";
-        exprs[2]->disp(os, self);
-    }
-};
-
-/* assumes funcdefs does not already have md.lock()->func_name */
-void expr_add_to_defs(const wptrmapdefexpr_t &md) {
-    funcdefs[md.lock()->func_name] = md;
-}
-
-DEF_PTRFUN(mapdefexpr);
+static std::unordered_map<std::wstring, sptrobjexpr_t> reserved_names; /* NOLINT */
 
 struct mapcallexpr_t : virtual expr_t {
 
@@ -1101,7 +1149,7 @@ struct mapcallexpr_t : virtual expr_t {
         type = etype_t::mapcallexpr_t;
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         std::optional<sptrexpr_t> ofnres = exprs[0]->calculate();
         if (!ofnres.has_value()) {
             return {};
@@ -1111,28 +1159,63 @@ struct mapcallexpr_t : virtual expr_t {
             ERR_EXIT(1, "mapcallexpr_t: referenced function did not calculate to an objexpr_t, was %s", wstr_to_str(fnres->disp_to_str()).c_str());
         }
         sptrobjexpr_t fn = from_expr<objexpr_t>(std::move(fnres));
-        if (!fn->obj.name.has_value()) {
-            ERR_EXIT(1, "mapcallexpr_t: referenced function calculated to an anonymous objexpr_t, was %s", wstr_to_str(fnres->disp_to_str()).c_str());
+        if (fn->obj.map_param_names.size() != exprs.size() - 1) {
+            ERR_EXIT(1, "mapcallexpr_t: incorrect number of parameters passed to function name %s, expected %zu, got %zu", wstr_to_str(fn->name.value()).c_str(), fn->obj.map_param_names.size(), exprs.size() - 1);
         }
-        if (!funcdefs.contains(fn->obj.name.value())) {
-            ERR_EXIT(1, "mapcallexpr_t: referenced function calculated to a function name which was not defined previously, was %s", wstr_to_str(fn->obj.name.value()).c_str());
+        sptrexpr_t fnbody = fn->exprs[2]->copy();
+        if (fn->name.has_value()) {
+            std::wstring &fnname = fn->name.value();
+            if (reserved_names.contains(fnname)) {
+                if (fnname == L"\\cint") {
+                    std::optional<sptrexpr_t> oa = exprs[1]->calculate();
+                    if (!oa.has_value()) {
+                        return {};
+                    }
+                    sptrobjexpr_t a = from_expr<objexpr_t>(oa.value());
+                    if (a->obj.type != otype_t::bool_v) {
+                        return {};
+                    }
+                    mpzw_t i{};
+                    mpz_init(i.z);
+                    if (!std::get<bool>(a->obj.v)) {
+                        return make_mpzw(i);
+                    } else {
+                        mpz_set_ui(i.z, 1);
+                        return make_mpzw(i);
+                    }
+                } else if (fnname == L"\\tset") {
+                    std::optional<sptrexpr_t> oa = exprs[1]->calculate();
+                    if (!oa.has_value()) {
+                        return {};
+                    }
+                    sptrobjexpr_t a = from_expr<objexpr_t>(oa.value());
+                    return make_bool(a->obj.type == otype_t::set_t); /* hmmm, what about setgens? maybe those aren't for calculate */
+                } else if (fnname == L"\\ttuple") {
+                    std::optional<sptrexpr_t> oa = exprs[1]->calculate();
+                    if (!oa.has_value()) {
+                        return {};
+                    }
+                    sptrobjexpr_t a = from_expr<objexpr_t>(oa.value());
+                    return make_bool(a->obj.type == otype_t::tuple_t);
+                } else if (fnname == L"\\tsymbol") {
+                    std::optional<sptrexpr_t> oa = exprs[1]->calculate();
+                    if (!oa.has_value()) {
+                        return {};
+                    }
+                    sptrobjexpr_t a = from_expr<objexpr_t>(oa.value());
+                    return make_bool(a->obj.type == otype_t::symbol_t);
+                }
+                return {}; /* should not be reached */
+            }
         }
-        wptrmapdefexpr_t mapdef = funcdefs[fn->obj.name.value()];
-        if (mapdef.expired()) {
-            ERR_EXIT(1, "mapcallexpr_t: referenced function calculated to function name %s which was in funcdefs but with expired wptrmapdefexpr_t", wstr_to_str(fn->obj.name.value()).c_str());
-        }
-        sptrexpr_t fnbody = mapdef.lock()->func_body()->copy();
-        if (mapdef.lock()->param_names.size() != exprs.size() - 1) {
-            ERR_EXIT(1, "mapcallexpr_t: incorrect number of parameters passed to function name %s, expected %zu, got %zu", wstr_to_str(fn->obj.name.value()).c_str(), mapdef.lock()->param_names.size(), exprs.size() - 1);
-        }
-        for (std::size_t pi = 0; pi < mapdef.lock()->param_names.size(); pi++) {
-            const std::wstring &param_name = mapdef.lock()->param_names[pi];
+        for (std::size_t pi = 0; pi < fn->obj.map_param_names.size(); pi++) {
+            const std::wstring &param_name = fn->obj.map_param_names[pi];
             for (const auto &[obj, parent] : fnbody->all_objs) {
                 if (obj.expired()) {
                     continue;
                 }
-                if (obj.lock()->obj.name.has_value()) {
-                    if (obj.lock()->obj.name.value() == param_name) {
+                if (obj.lock()->name.has_value()) {
+                    if (obj.lock()->name.value() == param_name) {
                         sptrexpr_t sparent = parent.lock();
                         std::replace(sparent->exprs.begin(), sparent->exprs.end(), to_expr(obj.lock()), exprs[pi + 1]);
                         sparent->signal_dirty();
@@ -1148,8 +1231,12 @@ struct mapcallexpr_t : virtual expr_t {
     }
 
     void disp(std::wostream &os, const std::optional<wptrexpr_t> &parent) const override {
-        os << L"\\call ";
-        exprs[0]->disp(os, self);
+        sptrobjexpr_t of = from_expr<objexpr_t>(exprs[0]);
+        if (of->name.has_value()) {
+            os << of->name.value();
+        } else {
+            exprs[0]->disp(os, self);
+        }
         os << L'(';
         disp_exprs_sep(os, L", ", exprs.begin() + 1, exprs.end());
         os << L')';
@@ -1164,7 +1251,7 @@ struct addexpr_t : virtual expr_t {
         type = etype_t::addexpr_t;
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         std::variant<mpzw_t, dec_t> sum = mpzw_t{};
         mpz_init(std::get<mpzw_t>(sum).z);
         for (const sptrexpr_t &expr : exprs) {
@@ -1241,7 +1328,7 @@ struct negexpr_t : virtual expr_t {
         exprs[0]->disp_check_paren(os, parent);
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         std::optional<sptrexpr_t> ores = exprs[0]->calculate();
         if (!ores.has_value()) {
             return {};
@@ -1287,7 +1374,7 @@ struct subexpr_t : virtual expr_t {
         disp_exprs_sep(os, L" - ", exprs.begin(), exprs.end());
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         std::variant<mpzw_t, dec_t> sum = mpzw_t{};
         mpz_init(std::get<mpzw_t>(sum).z);
         if (exprs.empty()) {
@@ -1372,7 +1459,7 @@ struct mulexpr_t : virtual expr_t {
         disp_exprs_sep(os, L" * ", exprs.begin(), exprs.end());
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         std::variant<mpzw_t, dec_t> prod = mpzw_t{};
         mpz_init_set_ui(std::get<mpzw_t>(prod).z, 1);
         for (const sptrexpr_t &expr : exprs) {
@@ -1439,7 +1526,7 @@ struct divexpr_t : virtual expr_t {
         disp_exprs_sep(os, L" / ", exprs.begin(), exprs.end());
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         if (exprs.size() > 2) { /* divexprs like this are ambiguous and we won't allow them */
             ERR_EXIT(1, "divexpr_t: had too many sub expressions, expected at most 2, had %zu", exprs.size());
         }
@@ -1526,7 +1613,7 @@ struct powexpr_t : virtual expr_t {
         disp_exprs_sep(os, L" ^ ", exprs.begin(), exprs.end());
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         if (exprs.size() > 2) { /* powexprs like this are ambiguous and we won't allow them */
             ERR_EXIT(1, "powexpr_t: had too many sub expressions, expected at most 2, had %zu", exprs.size());
         }
@@ -1591,7 +1678,7 @@ struct eqexpr_t : virtual expr_t {
         disp_exprs_sep(os, L" = ", exprs.begin(), exprs.end());
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         if (exprs.empty()) {
             ERR_EXIT(1, "eqexpr_t: had no sub expressions, expected at least 1");
         }
@@ -1633,7 +1720,7 @@ struct andexpr_t : virtual expr_t {
         disp_exprs_sep(os, L" \\and ", exprs.begin(), exprs.end());
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         if (exprs.empty()) {
             ERR_EXIT(1, "andexpr_t: had no sub expressions, expected at least 1");
         }
@@ -1680,7 +1767,7 @@ struct orexpr_t : virtual expr_t {
         disp_exprs_sep(os, L" \\or ", exprs.begin(), exprs.end());
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         if (exprs.empty()) {
             ERR_EXIT(1, "orexpr_t: had no sub expressions, expected at least 1");
         }
@@ -1728,7 +1815,7 @@ struct notexpr_t : virtual expr_t {
         exprs[0]->disp_check_paren(os, parent);
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         if (exprs.empty()) {
             ERR_EXIT(1, "notexpr_t: had no sub expressions, expected exactly 1");
         }
@@ -1747,7 +1834,7 @@ struct notexpr_t : virtual expr_t {
             return {}; /* TODO: should this error? */
         }
         std::get<bool>(ores->obj.v) = !std::get<bool>(ores->obj.v);
-        return to_expr(ores);
+        return ores;
     }
 };
 
@@ -1775,7 +1862,7 @@ struct containedexpr_t : virtual expr_t {
         exprs[1]->disp_check_paren(os, parent);
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         if (exprs.size() < 2) {
             ERR_EXIT(1, "containedexpr_t: had too little sub expressions, expected exactly 2, got %zu", exprs.size());
         }
@@ -1832,7 +1919,7 @@ struct tuplegetexpr_t : virtual expr_t {
         os << L']';
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         if (exprs.size() < 2) {
             ERR_EXIT(1, "tuplegetexpr_t: had too little sub expressions, expected exactly 2, got %zu", exprs.size());
         }
@@ -1859,7 +1946,11 @@ struct tuplegetexpr_t : virtual expr_t {
         if (mpz_cmp_ui(ind.z, 0) < 0) {
             ERR_EXIT(1, "tuplegetexpr_t: expected index %s to be greater than or equal to 0", wstr_to_str(oindres->disp_to_str()).c_str());
         }
-        return ores->exprs[mpz_get_ui(ind.z)];
+        sptrexpr_t tgetres = ores->exprs[mpz_get_ui(ind.z)];
+        if (tgetres->type != etype_t::objexpr_t) {
+            return {};
+        }
+        return from_expr<objexpr_t>(tgetres);
     }
 };
 
@@ -1885,7 +1976,7 @@ struct subsetexpr_t : virtual expr_t {
         disp_exprs_sep(os, L" \\subset ", exprs.begin(), exprs.end());
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         return {}; /* TODO */
     }
 };
@@ -1917,7 +2008,7 @@ struct mapspecexpr_t : virtual expr_t {
         exprs[2]->disp_check_paren(os, self);
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         if (exprs.size() != 3) {
             ERR_EXIT(1, "mapspecexpr_t: expected 3 sub expressions, got %zu", exprs.size());
         }
@@ -1937,12 +2028,8 @@ struct mapspecexpr_t : virtual expr_t {
         if ((ores->obj.type != otype_t::map_t) || (oares->obj.type != otype_t::set_t) || (obres->obj.type != otype_t::set_t)) {
             return {}; /* TODO: should this error? */
         }
-        if (!funcdefs.contains(ores->obj.name.value())) { /* TODO: what about anonymous maps? */
-            return {}; /* TODO: should this error? */
-        }
-        wptrmapdefexpr_t mapdef = funcdefs[ores->obj.name.value()];
-        std::optional<sptrexpr_t> amdset = mapdef.lock()->exprs[0]->calculate();
-        std::optional<sptrexpr_t> bmdset = mapdef.lock()->exprs[1]->calculate();
+        std::optional<sptrexpr_t> amdset = ores->exprs[0]->calculate();
+        std::optional<sptrexpr_t> bmdset = ores->exprs[1]->calculate();
         if (!amdset.has_value() || !bmdset.has_value()) {
             return {};
         }
@@ -2006,7 +2093,7 @@ struct setspecexpr_t : virtual expr_t {
         os << L'}';
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         return {};
     }
 };
@@ -2039,7 +2126,7 @@ struct stexpr_t : virtual expr_t {
         os << L'}';
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         return {};
     }
 };
@@ -2072,7 +2159,7 @@ struct unionexpr_t : virtual expr_t {
         os << L'}';
     }
 
-    std::optional<sptrexpr_t> calculate() const override {
+    std::optional<sptrobjexpr_t> calculate() const override {
         return {};
     }
 };
@@ -2092,7 +2179,7 @@ double expr_t::dist_randgen(const expr_t &other, std::size_t sample_size = randg
     /* e->walk_const([&all_objs_e](const sptrexpr_t &texpr) {
         if (texpr->type == etype_t::objexpr_t && texpr->exprs.empty()) {
             sptrobjexpr_t tobjexpr = from_expr_copy<objexpr_t>(texpr);
-            if (tobjexpr->obj.name.has_value()) {
+            if (tobjexpr->name.has_value()) {
                 all_objs_e.push_back(from_expr<objexpr_t>(texpr));
             }
         }
@@ -2102,14 +2189,14 @@ double expr_t::dist_randgen(const expr_t &other, std::size_t sample_size = randg
     /* o->walk_const([&all_objs_o](const sptrexpr_t &texpr) {
         if (texpr->type == etype_t::objexpr_t && texpr->exprs.empty()) {
             sptrobjexpr_t tobjexpr = std::static_pointer_cast<objexpr_t>(texpr);
-            if (tobjexpr->obj.name.has_value()) {
+            if (tobjexpr->name.has_value()) {
                 all_objs_o.push_back(tobjexpr);
             }
         }
     }); */
 
     auto objnamecomp = [](const sptrobjexpr_t &a, const sptrobjexpr_t &b) {
-        return a->obj.name.value() < b->obj.name.value();
+        return a->name.value() < b->name.value();
     };
     std::sort(all_objs_e.begin(), all_objs_e.end(), objnamecomp);
     std::sort(all_objs_o.begin(), all_objs_o.end(), objnamecomp);
@@ -2125,7 +2212,7 @@ double expr_t::dist_randgen(const expr_t &other, std::size_t sample_size = randg
         if (teo == too) {
             ao.emplace_back(teo.get(), too.get());
         } else {
-            if (teo->obj.name.value() < too->obj.name.value()) {
+            if (teo->name.value() < too->name.value()) {
                 ao.emplace_back(teo.get(), nullptr);
                 j--;
             } else {
@@ -2240,6 +2327,8 @@ enum struct ttype_t : std::uint16_t {
 
     mpz,
     mpfr,
+
+    req_indicator
 };
 
 const std::unordered_map<std::wstring, ttype_t> ttype_ind_map = { /* NOLINT */
@@ -2255,6 +2344,7 @@ const std::unordered_map<std::wstring, ttype_t> ttype_ind_map = { /* NOLINT */
     {L"\\minus", ttype_t::subtract_indicator},
     {L"\\st", ttype_t::st_indicator},
     {L"\\map", ttype_t::map_indicator},
+    {L"\\req", ttype_t::req_indicator},
 
     /* {L"", ttype_t::none}, */
 
@@ -2323,31 +2413,30 @@ struct parsed_tok_t {
     }
 };
 
-/* ******************** NOTE: ON ZFC ******************** */
-/* we do not ENFORCE the axioms of ZFC. we provide arbitrary
- * set builder notation in setspecexpr_t, and thus it is
- * possible for input to specify for example a set of all
- * sets using the following \tset. this is not something
- * jellyspider will attempt to detect at runtime, since it
- * is far too expensive. while jellyspider will accept it
- * in parsing, it will not ever generate the tester
- * reserved names (the ones that start with \t) during
- * dist_randgen or similar.
- *
- */
+template <typename T>
+std::vector<T> new_push_back(std::vector<T> in, T &&elem) {
+    in.push_back(std::forward<T>(elem));
+    return in;
+}
 
-static std::vector<std::wstring> reserved_names = { /* NOLINT */
-    L"\\cint", /* map from bool to int, returns 0 if false and 1 if true */
-    L"\\tset", /* map to bool, returns true if input is a set, false otherwise */
-    L"\\ttuple", /* map to bool, returns true if input is a tuple, false otherwise */
-    L"\\tsymbol", /* map to bool, returns true if input is a symbol, false otherwise */
+enum struct parstate_t : std::uint16_t {
+    good,
+    incomplete,
+    req,
+    ut_reached
+};
+
+struct parres_t {
+    parstate_t type = parstate_t::incomplete;
+    std::optional<ttype_t> ut;
+    sptrexpr_t e;
 };
 
 struct parser_t {
-    std::unordered_map<std::wstring, sptrexpr_t> defobjs;
+    std::unordered_map<std::wstring, sptrexpr_t> defs;
 
     /* everything else not in here has higher precedence! */
-    static std::unordered_map<ttype_t, std::uint16_t> pred;
+    inline static std::unordered_map<ttype_t, std::uint16_t> pred;
 
 
     /* returns true if ok, assumes pos is initially valid */
@@ -2453,14 +2542,44 @@ struct parser_t {
         }
     }
 
-    /* if an until_tok is hit, we also consume it and place in tbuf */
-    void parse_until_any_of(sptrexpr_t e, const std::wstring_view &s, const std::vector<ttype_t> &until_tok, std::optional<std::size_t> max_count = {}) { /* NOLINT */
+    /* returns true if ok, assumes pos is initially valid */
+    bool peek_token(const std::wstring_view &s, const std::wstring_view::const_iterator &pos, parsed_tok_t &out, std::wstring_view::const_iterator *newpos, bool consume_whitespace = true) {
+        std::wstring_view::const_iterator nxpos = pos;
+        std::vector<parsed_tok_t> tempbuf;
+        bool r = get_token(s, nxpos, tempbuf, consume_whitespace);
+        if (tempbuf.size() == 1) {
+            out = tempbuf.front();
+        } else {
+            return false;
+        }
+        if (r && newpos != nullptr) {
+            *newpos = nxpos;
+        }
+        return r;
+    }
+
+    /* consumes if it matches */
+    bool expect_token(const std::wstring_view &s, std::wstring_view::const_iterator &pos, ttype_t ttype, bool consume_whitespace = true) {
+        parsed_tok_t pt;
+        std::wstring_view::const_iterator newpos = nullptr;
+        if (!peek_token(s, pos, pt, &newpos, consume_whitespace)) {
+            return false;
+        }
+        if (pt.type != ttype) {
+            return false;
+        }
+        pos = newpos;
+        return true;
+    }
+
+    /* if an until_tok is hit, we also consume it and place in tbuf
+     * immediately returns upon encountering \req token */
+    [[nodiscard]] parres_t parse_until_any_of(const std::wstring_view &s, const std::vector<ttype_t> &until_tok) { /* NOLINT */
         if (s.empty()) {
-            return;
+            return parres_t{.type = parstate_t::good};
         }
         std::vector<parsed_tok_t> tbuf;
         std::wstring_view::const_iterator pos = s.begin();
-        
 
 #define CHECK_COUNT \
     if (max_count.has_value()) { \
@@ -2469,14 +2588,16 @@ struct parser_t {
         } \
     }
 
-        std::optional<ttype_t> last_binary_type;
         std::uint64_t count = 0;
+        bool is_infix = false; /* only describes how previous expression was parsed (exprs.back()) */
+        std::optional<ttype_t> bintype;
+        std::vector<sptrexpr_t> exprs;
         auto compress_mapcall = [&]() {
-            if (count > 0) {
-                sptrexpr_t f = e->exprs.back();
-                e->del(f);
-                sptrexpr_t a = e->exprs.back();
-                e->del(a);
+            if (count > 0 && exprs.size() >= 2) {
+                sptrexpr_t f = exprs.back();
+                exprs.pop_back();
+                sptrexpr_t a = exprs.back();
+                exprs.pop_back();
                 sptrmapcallexpr_t mc = make_mapcallexpr();
                 mc->add(f);
                 bool added = false;
@@ -2492,27 +2613,83 @@ struct parser_t {
                 if (!added) {
                     mc->add(a);
                 }
+                exprs.push_back(mc);
             }
         };
         for (;; count++) {
-            compress_mapcall(); /* TODO */
-            /* TODO: however, we always have to parse more than count because they could be a mapcall */
+            if (!is_infix) {
+                compress_mapcall(); /* TODO */
+            }
+            is_infix = false;
             if (!get_token(s, pos, tbuf)) {
                 ERR_EXIT(1, "could not get valid token in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
             }
             if (tbuf.empty()) {
-                return;
+                return parres_t{.type = parstate_t::good};
             }
             if (tbuf.back().type == ttype_t::other_indicator) {
                 ERR_EXIT(1, "could not get valid token, unfinished indicator in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str())
             }
+            if (tbuf.back().type == ttype_t::req_indicator) {
+                return parres_t{.type = parstate_t::req}; /* NOTE */
+            }
             for (const ttype_t &ut : until_tok) {
                 if (ut == tbuf.back().type) {
-                    return;
+                    return parres_t{.type = parstate_t::ut_reached, .ut = ut};
                 }
             }
-            bool is_infix = false;
             switch (tbuf.back().type) {
+                case ttype_t::mpfr: {
+                    exprs.push_back(make_dec(dec_t(wstr_to_str(std::wstring(tbuf.back().t)))));
+                    break;
+                }
+                case ttype_t::mpz: {
+                    mpzw_t i{};
+                    std::string s = wstr_to_str(std::wstring(tbuf.back().t));
+                    mpz_init_set_str(i.z, s.data(), 10);
+                    exprs.push_back(make_mpzw(i));
+                    break;
+                }
+                case ttype_t::name: {
+                    if (tbuf.back().t == L"true") {
+                        exprs.push_back(make_bool(true));
+                    } else if (tbuf.back().t == L"false") {
+                        exprs.push_back(make_bool(false));
+                    } else if (auto it = reserved_names.find(std::wstring(tbuf.back().t)); it != reserved_names.end()) {
+                        exprs.push_back(it->second);
+                    } else {
+                        std::wstring tname(tbuf.back().t);
+                        parsed_tok_t ntok;
+                        peek_token(s, pos, ntok);
+                        bool declaring = false;
+                        if (ntok.type == ttype_t::colon) {
+                            get_token(s, pos, tbuf);
+                            peek_token(s, pos, ntok, false);
+                            if (ntok.type == ttype_t::eqsign) { /* TODO: change, this is wrong - add an expect()? */
+                                get_token(s, pos, tbuf, false);
+                                declaring = true;
+                            }
+                        }
+                        if (declaring) {
+                            if (defs.contains(tname)) {
+                                ERR_EXIT(1, "could not declare name %s, was defined previously as %s", cquote_stra(wstr_to_str(tname)), cquote_stra(wstr_to_str(defs[tname]->disp_to_str())));
+                            }
+                            parres_t r = parse_until_any_of(std::wstring_view(tbuf.back().t.end(), s.end()), until_tok);
+                            if (r.type != parstate_t::good) {
+                                return r;
+                            }
+                            r.e->name = tname;
+                            defs[tname] = r.e;
+                            exprs.push_back(r.e); /* declaring a name should return the parsed expr, right? or do we force declarations to occur on their own */
+                        } else {
+                            if (!defs.contains(tname)) {
+                                ERR_EXIT(1, "could not parse name %s, was not defined previously in %s", cquote_stra(wstr_to_str(tname)), wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
+                            }
+                            exprs.push_back(defs[tname]);
+                        }
+                    }
+                    break;
+                }
                 case ttype_t::symbol_indicator: {
                     if (!get_token(s, pos, tbuf)) {
                         ERR_EXIT(1, "could not get valid token, expected symbol name after \"\\sym\" in %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
@@ -2522,8 +2699,8 @@ struct parser_t {
                     }
                     sptrobjexpr_t oe = make_objexpr();
                     oe->obj.type = otype_t::symbol_t;
-                    oe->obj.name = tbuf.back().t;
-                    e->add(oe);
+                    oe->name = tbuf.back().t;
+                    exprs.push_back(oe);
                     tbuf.pop_back();
                     tbuf.pop_back();
                     break;
@@ -2531,61 +2708,103 @@ struct parser_t {
                 case ttype_t::unresolvable_indicator: {
                     sptrobjexpr_t oe = make_objexpr();
                     oe->obj.type = otype_t::unresolvable_t;
-                    e->add(oe);
+                    exprs.push_back(oe);
                     tbuf.pop_back();
                     break;
                 }
                 case ttype_t::not_indicator: {
                     sptrnotexpr_t ne = make_notexpr();
-                    parse_until_any_of(to_expr(ne), std::wstring_view(tbuf.back().t.end(), s.end()), until_tok, 1);
-                    e->add(ne);
+                    parse_until_any_of(to_expr(ne), std::wstring_view(tbuf.back().t.end(), s.end()), until_tok);
+                    exprs.push_back(ne);
                     tbuf.pop_back();
                     break;
                 }
+
+                /* infix section */
+
                 case ttype_t::in_indicator: {
-                    if (e->exprs.empty()) { /* needs previous expression */
+                    if (exprs.empty()) { /* needs previous expression */
                         ERR_EXIT(1, "could not parse an \"\\in\" expression, expected previous expression near %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
                     }
                     is_infix = true;
                     sptrcontainedexpr_t ce = make_containedexpr();
-                    sptrexpr_t a = e->exprs.back();
-                    e->exprs.pop_back(); /* steal one off */
-                    parse_until_any_of(e, std::wstring_view(tbuf.back().t.end(), s.end()), until_tok, 1); /* get one more */
-                    continue; /* TODO: is this correct? we need to store the last parsed binexpr type, no? */
+                    if (bintype.has_value()) {
+                        if (pred[bintype.value()] <= pred[ttype_t::in_indicator]) {
+                            /* TODO */
+                            sptrexpr_t b = std::make_shared<expr_t>();
+                            parse_until_any_of(b, std::wstring_view(tbuf.back().t.end(), s.end()), until_tok); /* get one more */
+                        } else {
+
+                        }
+                    }
+                    sptrexpr_t a = exprs.back(); /* steal one off */
+                    exprs.pop_back();
+                    ce->add(a);
+                    sptrexpr_t b;
+                    parse_until_any_of(b, std::wstring_view(tbuf.back().t.end(), s.end()), until_tok); /* get one more */
+                    ce->add(b);
+                    exprs.push_back(ce);
+                    bintype = ttype_t::in_indicator;
+                    continue;
                 }
 
-                /* infix section */
                 case ttype_t::and_indicator: {
+                    if (exprs.empty()) { /* needs previous expression */
+                        ERR_EXIT(1, "could not parse an \"\\and\" expression, expected previous expression near %s", wstr_to_str(std::wstring(std::wstring_view(pos, s.end()))).c_str());
+                    }
                     is_infix = true;
+                    sptrandexpr_t ae = make_andexpr();
+                    sptrexpr_t a = exprs.back();
+                    exprs.pop_back();
+                    continue;
                 }
             }
-            if (!is_infix) {
-                /* specifying the sets for each map is optional, since they are not required for simply calling maps */
-                /* Fn: {(A, B) | \tset A \and \tset B} -> Map := (A, B) -> {f | f: A -> B}
-                 * f: Fn(R, R) -> Fn(R, R) := g -> (x -> g(x + 1))
-                 * h: R -> R := x -> 2 * x
-                 * f h 3 or (f h) 3 will expand to 2 * (3+1)
-                 */
-                /* abs: R -> R := x -> (x, -x)[Int(x < 0)]
-                 *                                            parsing artifact for implies \/                        parsing artifact for implies \/
-                 * lim: {f | f: N -> R} -> R := f -> L \st (epsilon \in R \and epsilon > 0 => \exists bign (bign \in N \and n \in N \and n > bign => abs(f n - L) < epsilon))
-                 *
-                 */
-                /* another example
-                   theorems:
-                 * a + b = b + a
-                 * 0 + a = 0
-                 * a - b = -b + a
-                 * a * (b + c) = a*b + a*c
-                 * a / b = a * (1 / b) \req b != 0
-                 * a / a = 1 \req a != 0
+            /* specifying the sets for each map is optional, since they are not required for defining maps you will simply call */
+            /* Fn: -> (A \st A \subset Map) := (A, B) -> {f | f: A -> B}
+             * f: Fn(R, R) -> Fn(R, R) := g -> (x -> g(x + 1))
+             * h: R -> R := x -> 2 * x
+             * f h 3 or (f h) 3 will expand to 2 * (3+1)
+             */
+            /* abs: R -> R := x -> (x, -x)[\cint(x < 0)]
+             *                                            parsing artifact for implies \/                        parsing artifact for implies \/
+             * lim: {f | f: N -> R} -> R := f -> L \st (epsilon \in R \and epsilon > 0 => \exists bign (bign \in N \and n \in N \and n > bign => abs(f n - L) < epsilon))
+             *
+             */
+            /* another example
 
-                   expression:
-                 * j := x -> x+1
-                 * (j 1 + 1 - j 1) / j 1
-                 */
-            }
-            return;
+               theorems:
+             * a + b = b + a
+             * 0 + a = 0
+             * a - b = -b + a
+             * 1 * a = a
+             * a * (b + c) = a * b + a * c
+             * a / 0 = \unresolvable
+             * a / b = a * (1 / b) \req b != 0
+             * a / a = 1 \req a != 0
+
+               expression:
+             * j := x -> x+1
+             * (j 1 + 1 - j 1) / j 1
+
+               path:
+             * (j 1 - j 1 + 1) / j 1
+             * (0 + 1) / j 1
+             * 1 / j 1
+             * 1 / (1+1)
+             * 1 / 2
+
+               alternate path:
+             * (j 1 + 1 - j 1) * 1 / j 1
+             * j 1 * 1 / j 1 + 1 * 1 / j 1 - j 1 * 1 / j 1
+             * j 1 / j 1 + 1 / j 1 - j 1 / j 1
+             * 1 + 1 / j 1 - 1
+             * 1 - 1 + 1 / j 1
+             * 0 + 1 / j 1
+             * 1 / j 1
+             * 1 / (1+1)
+             * 1 / 2
+             */
+            return parres_t{.type = parstate_t::incomplete};
         }
     }
 };
@@ -2606,6 +2825,23 @@ int main() {
         {ttype_t::comma, 100},
     };
 
+    reserved_names = {
+        {L"\\cint", make_objexpr()}, /* map from bool to int, returns 0 if false and 1 if true */
+        {L"\\tset", make_objexpr()}, /* map to bool, returns true if input is a set, false otherwise */
+        {L"\\ttuple", make_objexpr()}, /* map to bool, returns true if input is a tuple, false otherwise */
+        {L"\\tsymbol", make_objexpr()}, /* map to bool, returns true if input is a symbol, false otherwise */
+    };
+
+    /* fill up reserved names */
+    for (const auto &[a, b] : reserved_names) {
+        b->obj.type = otype_t::map_t;
+        b->name = a;
+        b->obj.map_param_names.emplace_back(L""); /* for size of map_param_names only, this does not get replaced anywhere */
+        b->add(make_none());
+        b->add(make_none());
+        b->add(make_none()); /* would be function body */
+    }
+
     // void *dlhandle = dlopen(WORK_SO_FILENAME, RTLD_LAZY);
     // expr_work = reinterpret_cast<decltype(expr_work)>(dlsym(dlhandle, "expr_work")); /* NOLINT */
     // if (expr_work == nullptr) {
@@ -2613,38 +2849,35 @@ int main() {
     // }
     // dlclose(dlhandle);
 
-    /* define f: {} -> {} := x -> x + 1 */
-    sptrmapdefexpr_t fndef = make_mapdefexpr();
-    sptrobjexpr_t domainset = make_objexpr();
-    domainset->obj.type = otype_t::set_t;
-    fndef->add(domainset->copy());
-    fndef->add(domainset);
+    /* define f := x -> x + 1 */
+    sptrobjexpr_t fn = make_objexpr();
+    fn->obj.type = otype_t::map_t;
+    sptrobjexpr_t dset = make_objexpr();
+    dset->obj.type = otype_t::set_t;
+    fn->add(make_none()); /* domain set */
+    fn->add(make_none()); /* codomain set */
     sptraddexpr_t fnbody = make_addexpr();
     sptrnegexpr_t neg = make_negexpr();
     sptrobjexpr_t var = make_objexpr();
-    var->obj.name = L"x";
+    var->name = L"x";
     neg->add(var);
     fnbody->add(neg);
     mpzw_t i{};
     mpz_init_set_ui(i.z, 1);
     sptrobjexpr_t one = make_mpzw(i);
     fnbody->add(one);
-    fndef->add(fnbody);
-    fndef->func_name = L"f";
-    fndef->param_names.emplace_back(L"x");
-    expr_add_to_defs(fndef);
+    fn->add(fnbody);
+    fn->name = L"f";
+    fn->obj.map_param_names.emplace_back(L"x");
 
     /* call the function */
     sptrmapcallexpr_t fncall = from_expr<mapcallexpr_t>(make_mapcallexpr());
-    sptrobjexpr_t fnref = make_objexpr();
-    fnref->obj.name = L"f";
-    fnref->obj.type = otype_t::map_t;
-    fncall->add(fnref);
+    fncall->add(fn);
     fncall->add(one->copy());
 
     sptrobjexpr_t ores = from_expr<objexpr_t>(fncall->calculate().value_or(make_objexpr()));
     std::wcout << "defined ";
-    fndef->disp(std::wcout, {});
+    fn->disp(std::wcout, {});
     std::wcout << std::endl;
     fncall->disp(std::wcout, {});
     std::wcout << " loaded to ";
